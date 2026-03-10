@@ -1,24 +1,15 @@
 import asyncio
 import scrapy
-from scrapy_playwright.page import PageMethod  # type: ignore[import]
+from scrapy_playwright.page import PageMethod
 
+# Fix for Windows Selector Event Loop
 try:
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 except AttributeError:
     pass
 
-# Helper function to block unnecessary resources and speed up Playwright
-def should_abort_request(request):
-    """Block images, fonts, and media to save bandwidth and load times."""
-    return request.resource_type in ["image", "media", "font", "stylesheet"]
-
 class HumanRedditSpider(scrapy.Spider):
     name = "reddit_human"
-
-    # Register the request interceptor
-    custom_settings = {
-        "PLAYWRIGHT_ABORT_REQUEST": should_abort_request,
-    }
 
     def __init__(self, target=None, k=50, username=None, password=None, *args, **kwargs):
         super(HumanRedditSpider, self).__init__(*args, **kwargs)
@@ -26,6 +17,7 @@ class HumanRedditSpider(scrapy.Spider):
         self.username = username
         self.password = password
         
+        # Determine the target URL
         if target:
             self.start_url = f"https://www.reddit.com/r/{target}/"
             self.target_name = f"r/{target}"
@@ -34,6 +26,7 @@ class HumanRedditSpider(scrapy.Spider):
             self.target_name = "Home Feed"
 
     def start_requests(self):
+        # 1. AUTHENTICATED MODE
         if self.username and self.password:
             self.logger.info(f"[*] Auth credentials found. Attempting login as {self.username}...")
             yield scrapy.Request(
@@ -41,32 +34,48 @@ class HumanRedditSpider(scrapy.Spider):
                 meta={
                     "playwright": True,
                     "playwright_include_page": True,
-                    "playwright_context": "auth_session",
+                    "playwright_context": "auth_session", # Create a named context to persist cookies
                 },
                 callback=self.parse_login,
                 errback=self.handle_error
             )
+        
+        # 2. ANONYMOUS MODE
         else:
             self.logger.info(f"[*] No credentials provided. Scraping {self.target_name} anonymously.")
             yield self._build_home_request()
 
     async def parse_login(self, response):
+        """Handles the login form interaction."""
         page = response.meta["playwright_page"]
+        
         try:
-            await page.wait_for_selector('input[name="username"]', timeout=15000)
+            self.logger.info("[-] Filling login credentials...")
+            
+            # Wait for username field (Reddit login pages change often, these are standard IDs)
+            await page.wait_for_selector('input[name="username"]')
             await page.fill('input[name="username"]', self.username)
             await page.fill('input[name="password"]', self.password)
             
+            # Click Login and wait for navigation
+            self.logger.info("[-] Clicking login...")
             async with page.expect_navigation(timeout=30000):
                 await page.click('button[type="submit"]')
                 
+            self.logger.info("[+] Login successful! Proceeding to target.")
+            
+            # Close login page to free resources
             await page.close()
+
+            # Now start the main scraping loop using the SAME context (cookies persist)
             yield self._build_home_request(context_name="auth_session")
+
         except Exception as e:
             self.logger.error(f"[!] Login failed: {e}")
             await page.close()
 
     def _build_home_request(self, context_name="default"):
+        """Helper to build the main feed request."""
         return scrapy.Request(
             url=self.start_url,
             meta={
@@ -74,7 +83,7 @@ class HumanRedditSpider(scrapy.Spider):
                 "playwright_include_page": True,
                 "playwright_context": context_name,
                 "playwright_page_methods": [
-                    PageMethod("wait_for_selector", "shreddit-post", timeout=15000),
+                    PageMethod("wait_for_selector", "shreddit-post", timeout=20000),
                 ],
             },
             callback=self.parse_home,
@@ -88,13 +97,17 @@ class HumanRedditSpider(scrapy.Spider):
 
         all_links = set()
         scroll_attempts = 0
-        max_scrolls = max(self.k // 5, 1)
+        max_scrolls = self.k // 5 
 
+        self.logger.info(f"[*] Starting smooth scroll on {self.target_name}...")
+
+        # --- SMOOTH SCROLL LOOP ---
         while len(all_links) < self.k and scroll_attempts < max_scrolls:
-            await page.evaluate("window.scrollBy(0, 2000)")
-            # Reduced timeout since we aren't loading heavy images anymore
-            await page.wait_for_timeout(1500) 
+            # Scroll logic
+            await page.evaluate("window.scrollBy(0, 1500)")
+            await page.wait_for_timeout(2500) 
             
+            # Extract links
             current_links = await page.evaluate("""
                 () => {
                     const posts = document.querySelectorAll('shreddit-post');
@@ -102,12 +115,19 @@ class HumanRedditSpider(scrapy.Spider):
                 }
             """)
             
+            new_count = 0
             for link in current_links:
-                all_links.add(link)
+                if link not in all_links:
+                    all_links.add(link)
+                    new_count += 1
             
             scroll_attempts += 1
+            if new_count > 0:
+                self.logger.info(f"[*] Scroll {scroll_attempts}: Found {new_count} new posts (Total: {len(all_links)})")
 
         self.logger.info(f"[+] Scroll complete. Scraping details for {len(all_links)} posts...")
+
+        # Pass the context name to ensure detail pages use the same login session
         context_name = response.meta.get("playwright_context", "default")
 
         for link in list(all_links)[:self.k]:
@@ -117,10 +137,9 @@ class HumanRedditSpider(scrapy.Spider):
                 meta={
                     "playwright": True,
                     "playwright_include_page": True,
-                    "playwright_context": context_name,
+                    "playwright_context": context_name, # Critical for auth persistence
                     "playwright_page_methods": [
-                        # Wait for comments, but with a slightly tighter timeout
-                        PageMethod("wait_for_selector", "shreddit-comment", timeout=10000),
+                        PageMethod("wait_for_selector", "shreddit-comment", timeout=15000),
                     ]
                 },
                 callback=self.parse_post,
@@ -135,6 +154,7 @@ class HumanRedditSpider(scrapy.Spider):
         data = {
             "url": response.url,
             "title": response.css("h1::text").get(),
+            # Fallback selectors for different reddit layouts
             "body": response.css("shreddit-post [slot='text-body'] p::text").getall() or \
                     response.css("div[id$='-post-rtjson-content'] p::text").getall(),
             "comments": response.css("shreddit-comment div[slot='comment'] p::text").getall()

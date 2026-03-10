@@ -1,89 +1,75 @@
-"""
-YAWC Backend — FastAPI + Crochet + Gemini/Anthropic
-Runs the Scrapy/Playwright spider inside FastAPI without ReactorNotRestartable.
-
-Install deps:
-    pip install fastapi uvicorn scrapy scrapy-playwright \
-                crochet google-generativeai anthropic \
-                sse-starlette python-dotenv
-    playwright install chromium
-"""
-
 import os
 import json
 import asyncio
-import threading
 import time
+import uuid
 from typing import AsyncIterator
-
-import crochet
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-from scrapy.crawler import CrawlerRunner
-from scrapy.utils.log import configure_logging
-from twisted.internet import defer
-
-from reddit_spider import YAWCSearchSpider, get_yawc_settings
-
+import sys
+import subprocess
 load_dotenv()
 
-# ─── Crochet: tames the Twisted reactor inside FastAPI ──────────────────────
-crochet.setup()
-configure_logging({"LOG_LEVEL": "WARNING"})
-
-# ─── LLM setup ────────────────────────────────────────────────────────────────
+# ─── LLM Setup ────────────────────────────────────────────────────────────────
 GEMINI_KEY   = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()   # "gemini" | "anthropic"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 
 if LLM_PROVIDER == "gemini" and GEMINI_KEY:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_KEY)
     _gemini_model = genai.GenerativeModel("gemini-2.5-flash")
-
 elif LLM_PROVIDER == "anthropic" and ANTHROPIC_KEY:
     import anthropic as _anthropic
     _anthropic_client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-# ─── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="YAWC API", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],      # tighten in prod
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ─── Subprocess Spider Runner ─────────────────────────────────────────────────
+async def scrape_reddit_isolated(query: str, k: int = 8) -> list[dict]:
+    """Runs the Scrapy spider and streams logs LIVE to the terminal."""
+    temp_file = f"temp_results_{uuid.uuid4().hex}.json"
+    
+    cmd = [
+        sys.executable, "-m", "scrapy", "runspider", "reddit_spider.py",
+        "-a", f"query={query}",
+        "-a", f"k={k}",
+        "-o", temp_file
+    ]
+    
+    print(f"\n[YAWC] Launching spider for query: '{query}'")
+    print("--- 🕷️ SCRAPY LIVE LOGS START ---\n")
+    
+    def run_spider_sync():
+        # By removing capture_output, Scrapy prints directly to your terminal
+        return subprocess.run(cmd)
 
-# ─── Scrapy runner (singleton — reactor must NOT be restarted) ────────────────
-_runner = CrawlerRunner(settings=get_yawc_settings())
+    try:
+        loop = asyncio.get_event_loop()
+        process = await loop.run_in_executor(None, run_spider_sync)
+        
+        print("\n--- 🕷️ SCRAPY LIVE LOGS END ---")
+            
+        results = []
+        if os.path.exists(temp_file):
+            with open(temp_file, 'r', encoding='utf-8') as f:
+                try:
+                    results = json.load(f)
+                except json.JSONDecodeError:
+                    pass
+            os.remove(temp_file)
+            
+        print(f"[YAWC] Spider finished. Found {len(results)} posts.")
+        return results
 
-
-@crochet.run_in_reactor
-def _run_spider(query: str, k: int, result_collector: list) -> defer.Deferred:
-    """Run spider in the Twisted reactor thread via Crochet."""
-    return _runner.crawl(
-        YAWCSearchSpider,
-        query=query,
-        k=k,
-        result_collector=result_collector,
-    )
-
-
-def scrape_reddit_sync(query: str, k: int = 8) -> list[dict]:
-    """
-    Blocking wrapper: calls Crochet, waits for crawl to finish.
-    Returns list of post dicts in-memory — zero disk I/O.
-    """
-    results: list[dict] = []
-    eventual = _run_spider(query, k, results)
-    eventual.wait(timeout=120)   # max 2 min before giving up
-    return results
-
-
-# ─── LLM synthesis ────────────────────────────────────────────────────────────
+    except Exception as e:
+        print(f"\n🚨 FATAL SUBPROCESS ERROR: {repr(e)}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        return []# ─── LLM Synthesis ────────────────────────────────────────────────────────────
 def _build_prompt(query: str, posts: list[dict]) -> str:
     context_parts = []
     for i, p in enumerate(posts, 1):
@@ -92,11 +78,10 @@ def _build_prompt(query: str, posts: list[dict]) -> str:
             f"[Post {i}] {p.get('subreddit', '')} | Score: {p.get('score', 0)}\n"
             f"Title: {p.get('title', '')}\n"
             f"URL: {p.get('url', '')}\n"
-            f"Body: {body[:800]}"       # cap per-post to keep prompt size reasonable
+            f"Body: {body[:800]}"
         )
-
     context = "\n\n---\n\n".join(context_parts)
-
+    
     return f"""You are YAWC — an AI research assistant that synthesizes Reddit discussions into clear, accurate answers.
 
 USER QUESTION: {query}
@@ -114,110 +99,53 @@ Instructions:
 
 YOUR SYNTHESIZED ANSWER:"""
 
-
 async def synthesize_with_llm(query: str, posts: list[dict]) -> str:
     prompt = _build_prompt(query, posts)
 
     if LLM_PROVIDER == "gemini" and GEMINI_KEY:
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: _gemini_model.generate_content(prompt)
-        )
+        response = await loop.run_in_executor(None, lambda: _gemini_model.generate_content(prompt))
         return response.text
-
     elif LLM_PROVIDER == "anthropic" and ANTHROPIC_KEY:
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: _anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1500,
-                messages=[{"role": "user", "content": prompt}],
-            )
-        )
+        response = await loop.run_in_executor(None, lambda: _anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=1500, messages=[{"role": "user", "content": prompt}]
+        ))
         return response.content[0].text
-
     else:
-        # Fallback: echo context without LLM (useful for testing)
         return f"[No LLM configured] Found {len(posts)} Reddit posts about '{query}':\n\n" + \
                "\n".join(f"• {p['title']}" for p in posts[:5])
 
-
-# ─── SSE streaming endpoint ───────────────────────────────────────────────────
+# ─── API Endpoint ─────────────────────────────────────────────────────────────
 @app.get("/api/search")
 async def search_stream(q: str = Query(..., min_length=2)) -> EventSourceResponse:
-    """
-    Server-Sent Events endpoint.
-    Streams status events so the UI can show live progress (like ChatGPT Deep Research).
-
-    Events:
-        status  — intermediate messages ("Searching Reddit…", "Scraping N posts…")
-        result  — final JSON payload {answer, sources}
-        error   — something went wrong
-    """
-
     async def event_generator() -> AsyncIterator[dict]:
         try:
-            # ── 1. Acknowledge ─────────────────────────────────────────────
-            yield {"event": "status", "data": json.dumps({"message": "🔍 Searching Reddit…"})}
-
+            yield {"event": "status", "data": json.dumps({"message": "🔍 Spinning up YAWC headless browser..."})}
             t0 = time.time()
-
-            # ── 2. Run spider in thread (blocking, must NOT block event loop) ─
-            loop = asyncio.get_event_loop()
-            posts = await loop.run_in_executor(None, scrape_reddit_sync, q, 8)
-
+            
+            # Run the isolated spider
+            posts = await scrape_reddit_isolated(q, 8)
             scrape_time = round(time.time() - t0, 1)
 
             if not posts:
-                yield {
-                    "event": "error",
-                    "data": json.dumps({"message": "No Reddit posts found. Try a different query."}),
-                }
+                yield {"event": "error", "data": json.dumps({"message": "No Reddit posts found or spider was blocked. Try a different query."})}
                 return
 
-            yield {
-                "event": "status",
-                "data": json.dumps({
-                    "message": f"📄 Scraped {len(posts)} posts in {scrape_time}s. Thinking…",
-                }),
-            }
-
-            # ── 3. Synthesize ──────────────────────────────────────────────
+            yield {"event": "status", "data": json.dumps({"message": f"📄 Scraped {len(posts)} posts in {scrape_time}s. Synthesizing answer..."})}
+            
             answer = await synthesize_with_llm(q, posts)
-
             sources = [
-                {
-                    "title": p.get("title", ""),
-                    "url": p.get("url", ""),
-                    "subreddit": p.get("subreddit", ""),
-                    "score": p.get("score", 0),
-                }
+                {"title": p.get("title", ""), "url": p.get("url", ""), "subreddit": p.get("subreddit", ""), "score": p.get("score", 0)}
                 for p in posts
             ]
 
-            yield {
-                "event": "result",
-                "data": json.dumps({"answer": answer, "sources": sources}),
-            }
-
+            yield {"event": "result", "data": json.dumps({"answer": answer, "sources": sources})}
         except Exception as exc:
-            yield {
-                "event": "error",
-                "data": json.dumps({"message": f"Error: {str(exc)}"}),
-            }
+            yield {"event": "error", "data": json.dumps({"message": f"Error: {str(exc)}"}) }
 
     return EventSourceResponse(event_generator())
 
-
-# ─── Health check ─────────────────────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    return {"status": "ok", "provider": LLM_PROVIDER}
-
-
-# ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
