@@ -1,16 +1,22 @@
 """
-YAWC Backend v2 — FastAPI + Async Subprocess + Token Streaming + Deep Research
-Features:
-  - Async subprocess (non-blocking asyncio.create_subprocess_exec)
-  - LLM token streaming via SSE
-  - Quick (k=8) and Deep Research (k=30) modes
-  - Inline citation references [1][2][3] in the answer
-  - Deep research: themes + pros/cons + consensus sections
+YAWC Backend v4 — Intent Router + Multi-Platform Spider Dispatcher
+FastAPI + Async Subprocess + Token Streaming + Mixed-Media Synthesis
+
+New in V4:
+  - LLM Intent Router: classifies query → VIDEO | IMAGE | TEXT
+  - Modular spider dispatch: youtube_spider, image_spider, text_spider
+  - Mixed-media prompt builder: [YOUTUBE_EMBED: url], ![alt](url), [N] citations
+  - Source platform tagging: YouTube, StackOverflow, Pinterest, Reddit, Quora
 
 Install:
     pip install fastapi uvicorn scrapy scrapy-playwright \
                 google-generativeai anthropic sse-starlette python-dotenv
     playwright install chromium
+
+Env vars (.env):
+    GEMINI_API_KEY=...
+    ANTHROPIC_API_KEY=...
+    LLM_PROVIDER=gemini   # or "anthropic"
 """
 
 import os
@@ -22,7 +28,7 @@ import uuid
 import platform
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
@@ -46,7 +52,7 @@ elif LLM_PROVIDER == "anthropic" and ANTHROPIC_KEY:
     _anthropic_client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="YAWC API", version="2.0.0")
+app = FastAPI(title="YAWC API", version="4.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,80 +60,128 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ─── Cross-Platform Async Spider Runner ──────────────────────────────────────
-#
-# ROOT CAUSE of the Windows error:
-#   asyncio.create_subprocess_exec requires ProactorEventLoop on Windows.
-#   FastAPI/uvicorn uses WindowsSelectorEventLoopPolicy by default (Python 3.8+),
-#   which does NOT support subprocess. Switching to ProactorEventLoop breaks
-#   uvicorn's internal socket handling. There's no clean fix inside the same loop.
-#
-# SOLUTION — two-path strategy:
-#   • Windows → run_in_executor(ThreadPoolExecutor, subprocess.run)
-#               The spider runs in a thread pool worker. The FastAPI event loop
-#               stays free for other requests. subprocess.run is blocking but
-#               confined to its own thread — this is the correct Windows pattern.
-#   • Linux/Mac → asyncio.create_subprocess_exec (truly async, no threads needed)
-#
-# Both paths produce identical results. The temp-file handoff is the same.
-
-# Thread pool for Windows subprocess execution (reused across requests)
+# Thread pool for Windows subprocess execution
 _thread_pool = ThreadPoolExecutor(max_workers=4)
 
+# ─── Intent Types ─────────────────────────────────────────────────────────────
+IntentType = Literal["VIDEO", "IMAGE", "TEXT"]
 
-def _run_spider_blocking(cmd: list[str], temp_file: str) -> None:
-    """Blocking subprocess call — safe to run inside a thread pool executor."""
-    result = subprocess.run(
-        cmd,
-        capture_output=False,   # let Scrapy logs print to terminal live
-        text=True,
+# Spider file map — maps intent → spider filename
+SPIDER_MAP: dict[IntentType, str] = {
+    "VIDEO": "youtube_spider.py",
+    "IMAGE": "image_spider.py",
+    "TEXT":  "text_spider.py",
+}
+
+# Default k (number of results) per intent
+K_MAP: dict[IntentType, dict[str, int]] = {
+    "VIDEO": {"quick": 3, "deep": 6},
+    "IMAGE": {"quick": 5, "deep": 10},
+    "TEXT":  {"quick": 8, "deep": 30},
+}
+
+# ─── LLM Intent Router ────────────────────────────────────────────────────────
+
+INTENT_SYSTEM_PROMPT = """You are a query intent classifier. Given a user search query, classify it into exactly ONE of these three categories:
+
+VIDEO  — The user wants tutorials, how-to videos, gameplay footage, video reviews, or explicitly mentions "video", "watch", "YouTube".
+IMAGE  — The user wants visual inspiration, photos, diagrams, design ideas, wallpapers, or explicitly mentions "picture", "image", "photo", "inspiration".
+TEXT   — Everything else: general questions, coding help, discussions, comparisons, recommendations, news, opinions.
+
+Reply with ONLY one word: VIDEO, IMAGE, or TEXT. No explanation."""
+
+
+def _classify_intent_blocking(query: str) -> IntentType:
+    """
+    Synchronous LLM call to classify query intent.
+    Designed to be run inside an executor (non-blocking for asyncio).
+    Falls back to TEXT on any error.
+    """
+    prompt = f"{INTENT_SYSTEM_PROMPT}\n\nQuery: {query}"
+
+    try:
+        if LLM_PROVIDER == "gemini" and GEMINI_KEY:
+            response = _gemini_model.generate_content(prompt)
+            raw = response.text.strip().upper()
+        elif LLM_PROVIDER == "anthropic" and ANTHROPIC_KEY:
+            message = _anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=10,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text.strip().upper()
+        else:
+            return "TEXT"  # No LLM configured
+
+        # Validate — only accept exact known intents
+        if raw in ("VIDEO", "IMAGE", "TEXT"):
+            return raw  # type: ignore[return-value]
+        return "TEXT"
+
+    except Exception as e:
+        print(f"[YAWC] Intent classification failed: {e}. Defaulting to TEXT.", flush=True)
+        return "TEXT"
+
+
+async def classify_intent(query: str) -> IntentType:
+    """Non-blocking wrapper around _classify_intent_blocking."""
+    loop = asyncio.get_event_loop()
+    intent: IntentType = await loop.run_in_executor(
+        _thread_pool,
+        _classify_intent_blocking,
+        query,
     )
+    print(f"[YAWC] Intent: '{query}' → {intent}", flush=True)
+    return intent
+
+
+# ─── Cross-Platform Async Spider Runner ──────────────────────────────────────
+
+def _run_spider_blocking(cmd: list[str]) -> None:
+    """Blocking subprocess call — safe inside a thread pool executor."""
+    result = subprocess.run(cmd, capture_output=False, text=True)
     if result.returncode not in (0, 1):
-        # returncode=1 is normal for Scrapy when some requests fail
         print(f"[YAWC] Spider exited with code {result.returncode}", flush=True)
 
 
-async def scrape_reddit_async(query: str, k: int, status_callback=None) -> list[dict]:
+async def scrape_async(
+    query: str,
+    k: int,
+    spider_file: str,
+) -> list[dict]:
     """
-    Launch Scrapy spider as a non-blocking subprocess (cross-platform).
-    Results are written to a temp JSON file, then read into memory.
-    No temp file is left on disk.
+    Launch the appropriate Scrapy spider as a non-blocking subprocess.
+    Results land in a temp JSON file, then loaded into memory.
+
+    All spiders receive:
+        -a query=<query>
+        -a k=<k>
+    and write output to a temp file via -o flag.
     """
-    # Use system temp dir — works on both Windows and Linux
     import tempfile
     temp_dir  = tempfile.gettempdir()
     temp_file = os.path.join(temp_dir, f"yawc_{uuid.uuid4().hex}.json")
-
-    # On Windows /dev/null doesn't exist — use NUL instead
-    null_device = "NUL" if platform.system() == "Windows" else "/dev/null"
+    null_dev  = "NUL" if platform.system() == "Windows" else "/dev/null"
 
     cmd = [
         sys.executable, "-m", "scrapy", "runspider",
-        "reddit_spider.py",
+        spider_file,
         "-a", f"query={query}",
         "-a", f"k={k}",
         "-o", temp_file,
-        "--logfile", null_device,
+        "--logfile", null_dev,
     ]
 
-    print(f"[YAWC] Launching spider | query={query!r} k={k} platform={platform.system()}", flush=True)
+    print(
+        f"[YAWC] Launching {spider_file} | query={query!r} k={k} "
+        f"platform={platform.system()}",
+        flush=True,
+    )
 
-    IS_WINDOWS = platform.system() == "Windows"
-
-    if IS_WINDOWS:
-        # ── Windows path: thread pool executor (non-blocking for asyncio) ──────
-        # subprocess.run is blocking, but ThreadPoolExecutor isolates it from
-        # the event loop. FastAPI can serve other requests while spider runs.
+    if platform.system() == "Windows":
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            _thread_pool,
-            _run_spider_blocking,
-            cmd,
-            temp_file,
-        )
+        await loop.run_in_executor(_thread_pool, _run_spider_blocking, cmd)
     else:
-        # ── Unix path: truly async subprocess (no threads needed) ────────────
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -142,7 +196,6 @@ async def scrape_reddit_async(query: str, k: int, status_callback=None) -> list[
 
         await asyncio.gather(drain_stderr(), process.wait())
 
-    # ── Read results from temp file ──────────────────────────────────────────
     results = []
     if os.path.exists(temp_file):
         try:
@@ -150,7 +203,7 @@ async def scrape_reddit_async(query: str, k: int, status_callback=None) -> list[
                 raw = json.load(f)
                 results = raw if isinstance(raw, list) else [raw]
         except (json.JSONDecodeError, ValueError) as e:
-            print(f"[YAWC] Could not parse results file: {e}", flush=True)
+            print(f"[YAWC] Could not parse results: {e}", flush=True)
         finally:
             try:
                 os.remove(temp_file)
@@ -159,94 +212,160 @@ async def scrape_reddit_async(query: str, k: int, status_callback=None) -> list[
     else:
         print(f"[YAWC] ⚠ Temp file not found: {temp_file}", flush=True)
 
-    print(f"[YAWC] Spider done. Found {len(results)} posts.", flush=True)
+    print(f"[YAWC] Done. {len(results)} results from {spider_file}.", flush=True)
     return results
 
 
-# ─── Prompt Builders ──────────────────────────────────────────────────────────
+# ─── Mixed-Media Prompt Builders ──────────────────────────────────────────────
 
-def _build_quick_prompt(query: str, posts: list[dict]) -> str:
-    """Quick mode: concise synthesis with inline [N] citations."""
+def _build_video_prompt(query: str, posts: list[dict], mode: str) -> str:
+    """
+    Video mode: instructs LLM to embed YouTube iframes via [YOUTUBE_EMBED: url].
+    Each post has: url, embed_url, title, description, channel, views.
+    """
     context_parts = []
     for i, p in enumerate(posts, 1):
+        context_parts.append(
+            f"[{i}] YouTube | Channel: {p.get('channel', 'Unknown')}\n"
+            f"Title: {p.get('title', '')}\n"
+            f"Views: {p.get('views', 'N/A')}\n"
+            f"Description: {(p.get('description') or '')[:400]}\n"
+            f"Watch URL: {p.get('url', '')}\n"
+            f"Embed URL: {p.get('embed_url', '')}"
+        )
+    context = "\n\n".join(context_parts)
+
+    depth = (
+        "Provide a concise 2-paragraph overview."
+        if mode == "quick"
+        else "Provide a structured report: Summary, Key Takeaways per video, Best For, and Notable Differences."
+    )
+
+    return f"""You are YAWC, an AI that synthesizes YouTube search results into helpful answers.
+
+USER QUESTION: {query}
+
+YOUTUBE VIDEOS (reference by number inline, e.g. [1] [2]):
+{context}
+
+Instructions:
+- {depth}
+- For EACH video you recommend, output a YouTube embed tag on its own line in this exact format:
+  [YOUTUBE_EMBED: <embed_url>]
+  Replace <embed_url> with the actual Embed URL from the video data above.
+- After the embed tag, write the video title and a one-sentence reason to watch it.
+- Use inline citations [N] when referencing video content in your prose.
+- Do NOT invent information. Only use data from the provided videos.
+
+ANSWER:"""
+
+
+def _build_image_prompt(query: str, posts: list[dict], mode: str) -> str:
+    """
+    Image mode: instructs LLM to render images via standard markdown ![alt](url).
+    Each post has: url, image_url, alt, source, width, height.
+    """
+    context_parts = []
+    for i, p in enumerate(posts, 1):
+        context_parts.append(
+            f"[{i}] Source: {p.get('source', 'image')}\n"
+            f"Alt: {p.get('alt', '')}\n"
+            f"Image URL: {p.get('image_url', '')}\n"
+            f"Page URL: {p.get('url', '')}"
+        )
+    context = "\n\n".join(context_parts)
+
+    depth = (
+        "Write a brief 1-paragraph visual summary."
+        if mode == "quick"
+        else "Write a structured visual report: Overview, Style Analysis, Color Palette Notes, and Usage Recommendations."
+    )
+
+    return f"""You are YAWC, an AI that synthesizes visual search results into helpful answers.
+
+USER QUESTION: {query}
+
+IMAGES FOUND (reference by number inline, e.g. [1] [2]):
+{context}
+
+Instructions:
+- {depth}
+- For EACH image you discuss, embed it using standard markdown on its own line:
+  ![<alt text>](<image_url>)
+  Use the exact Image URL from the data above.
+- Use inline citations [N] when referencing images in prose.
+- Comment on visual style, color, composition where relevant.
+- Do NOT invent alt text — use the provided alt or a concise descriptive phrase.
+
+ANSWER:"""
+
+
+def _build_text_prompt(query: str, posts: list[dict], mode: str) -> str:
+    """
+    Text mode: Reddit / StackOverflow / Quora synthesis with [N] inline citations.
+    Each post has: url, title, body, subreddit/platform, score.
+    """
+    context_parts = []
+    for i, p in enumerate(posts, 1):
+        platform_label = p.get("subreddit") or p.get("platform", "web")
         body = (p.get("body") or "").strip() or "(no body text)"
         context_parts.append(
-            f"[{i}] {p.get('subreddit','')} | ↑{p.get('score',0)}\n"
-            f"Title: {p.get('title','')}\n"
+            f"[{i}] {platform_label} | ↑{p.get('score', 0)}\n"
+            f"Title: {p.get('title', '')}\n"
             f"Body: {body[:600]}"
         )
     context = "\n\n".join(context_parts)
 
-    return f"""You are YAWC, an AI that synthesizes Reddit discussions into clear answers.
+    if mode == "quick":
+        instructions = (
+            "Answer the question directly and concisely (2-4 paragraphs). "
+            "Cite sources inline using [N] notation after each claim."
+        )
+    else:
+        instructions = (
+            "Produce a structured deep research report with these exact sections:\n\n"
+            "## Summary\n2-3 sentence overview.\n\n"
+            "## Key Themes\nThe 3-5 most recurring themes. Cite with [N].\n\n"
+            "## Pros & Cons\n**Pros**: ...\n**Cons**: ...\n\n"
+            "## Reddit Consensus\nOverall community verdict.\n\n"
+            "## Notable Opinions\n1-2 standout or contrarian takes."
+        )
+
+    return f"""You are YAWC, an AI that synthesizes web discussions into clear answers.
 
 USER QUESTION: {query}
 
-REDDIT POSTS (reference by number inline, e.g. [1] [3]):
+POSTS (reference by number inline, e.g. [1][3]):
 {context}
 
 Instructions:
-- Answer the question directly and concisely (2-4 paragraphs).
-- Cite sources inline using [N] notation after each claim (e.g. "Users prefer X [1][3]").
+- {instructions}
 - Be honest if posts don't fully answer the question.
 - Do NOT invent information beyond what the posts contain.
 
 ANSWER:"""
 
 
-def _build_deep_prompt(query: str, posts: list[dict]) -> str:
-    """Deep Research mode: themes + pros/cons + consensus + citations."""
-    context_parts = []
-    for i, p in enumerate(posts, 1):
-        body = (p.get("body") or "").strip() or "(no body text)"
-        context_parts.append(
-            f"[{i}] {p.get('subreddit','')} | ↑{p.get('score',0)}\n"
-            f"Title: {p.get('title','')}\n"
-            f"Body: {body[:500]}"
-        )
-    context = "\n\n".join(context_parts)
-
-    return f"""You are YAWC, a deep research AI that synthesizes Reddit discussions into structured reports.
-
-USER QUESTION: {query}
-
-REDDIT POSTS ({len(posts)} scraped, reference inline as [N]):
-{context}
-
-Produce a structured deep research report with these exact sections:
-
-## Summary
-2-3 sentence overview of what Reddit says about this topic.
-
-## Key Themes
-The 3-5 most recurring themes or ideas across posts. Use inline citations [N].
-
-## Pros & Cons
-**Pros** (what people recommend / praise):
-**Cons** (complaints, warnings, caveats):
-
-## Reddit Consensus
-What is the overall community verdict or recommendation? Is there disagreement?
-
-## Notable Opinions
-1-2 standout takes that are insightful or contrarian.
-
-Rules:
-- Cite with [N] after every claim.
-- Only use information from the provided posts.
-- Be direct. No filler phrases.
-
-DEEP RESEARCH REPORT:"""
+def build_prompt(
+    query: str,
+    posts: list[dict],
+    intent: IntentType,
+    mode: str,
+) -> str:
+    if intent == "VIDEO":
+        return _build_video_prompt(query, posts, mode)
+    if intent == "IMAGE":
+        return _build_image_prompt(query, posts, mode)
+    return _build_text_prompt(query, posts, mode)
 
 
 # ─── LLM Streaming ────────────────────────────────────────────────────────────
 
 async def stream_gemini(prompt: str) -> AsyncIterator[str]:
-    """Stream Gemini tokens via async generator."""
     loop = asyncio.get_event_loop()
-    # Gemini streaming: generate_content with stream=True
     response = await loop.run_in_executor(
         None,
-        lambda: _gemini_model.generate_content(prompt, stream=True)
+        lambda: _gemini_model.generate_content(prompt, stream=True),
     )
     for chunk in response:
         if chunk.text:
@@ -254,10 +373,8 @@ async def stream_gemini(prompt: str) -> AsyncIterator[str]:
 
 
 async def stream_anthropic(prompt: str) -> AsyncIterator[str]:
-    """Stream Anthropic Claude tokens via async generator."""
     loop = asyncio.get_event_loop()
 
-    # Build streaming message in executor to avoid blocking
     def _create_stream():
         return _anthropic_client.messages.stream(
             model="claude-sonnet-4-20250514",
@@ -272,7 +389,6 @@ async def stream_anthropic(prompt: str) -> AsyncIterator[str]:
 
 
 async def stream_llm(prompt: str) -> AsyncIterator[str]:
-    """Route to the correct LLM streamer."""
     if LLM_PROVIDER == "gemini" and GEMINI_KEY:
         async for token in stream_gemini(prompt):
             yield token
@@ -280,94 +396,152 @@ async def stream_llm(prompt: str) -> AsyncIterator[str]:
         async for token in stream_anthropic(prompt):
             yield token
     else:
-        # Fallback: yield a single mock response token-by-token
-        msg = f"[No LLM configured] Found {0} posts.\nSet GEMINI_API_KEY or ANTHROPIC_API_KEY in .env"
+        msg = "[No LLM configured] Set GEMINI_API_KEY or ANTHROPIC_API_KEY in .env"
         for word in msg.split(" "):
             yield word + " "
             await asyncio.sleep(0.02)
 
 
+# ─── Source Normalizer ────────────────────────────────────────────────────────
+
+def normalize_sources(posts: list[dict], intent: IntentType) -> list[dict]:
+    """
+    Normalize scraped results into a consistent source format for the frontend.
+    Adds a `platform` field the UI uses to render the correct badge icon.
+    """
+    sources = []
+    for i, p in enumerate(posts, 1):
+        url = p.get("url", "")
+
+        # Infer platform from URL if not explicitly set
+        if intent == "VIDEO":
+            pl = "YouTube"
+        elif intent == "IMAGE":
+            if "pinterest" in url:
+                pl = "Pinterest"
+            elif "unsplash" in url:
+                pl = "Unsplash"
+            else:
+                pl = "Images"
+        else:
+            if "stackoverflow" in url:
+                pl = "StackOverflow"
+            elif "quora" in url:
+                pl = "Quora"
+            else:
+                pl = p.get("subreddit") or "Reddit"
+
+        source: dict = {
+            "index":    i,
+            "title":    p.get("title", ""),
+            "url":      url,
+            "platform": pl,
+            "score":    p.get("score", p.get("views", p.get("likes", 0))),
+        }
+
+        # Extra fields for video/image
+        if intent == "VIDEO":
+            source["embed_url"] = p.get("embed_url", "")
+            source["channel"]   = p.get("channel", "")
+            source["thumbnail"] = p.get("thumbnail", "")
+        elif intent == "IMAGE":
+            source["image_url"] = p.get("image_url", "")
+            source["alt"]       = p.get("alt", "")
+
+        sources.append(source)
+
+    return sources
+
+
 # ─── SSE Search Endpoint ──────────────────────────────────────────────────────
-# SSE event types:
-#   status  → { message: str }                        — progress update
-#   token   → { token: str }                          — LLM streaming chunk
-#   sources → { sources: [{title,url,subreddit,score,index}] }
-#   done    → {}                                      — stream complete
-#   error   → { message: str }
 
 @app.get("/api/search")
 async def search_stream(
-    q: str    = Query(..., min_length=2),
+    q:    str = Query(..., min_length=2),
     mode: str = Query("quick"),
 ) -> EventSourceResponse:
     """
     Streams search progress + LLM tokens via SSE.
-    mode=quick  → k=8  posts, concise answer
-    mode=deep   → k=30 posts, structured deep report
+
+    SSE event types:
+      intent  → { intent: "VIDEO"|"IMAGE"|"TEXT" }
+      status  → { message: str }
+      sources → { sources: [...], intent: str }
+      token   → { token: str }
+      done    → {}
+      error   → { message: str }
     """
-    # Validate mode manually (avoids regex= vs pattern= FastAPI version issues)
     if mode not in ("quick", "deep"):
         mode = "quick"
 
     async def event_generator() -> AsyncIterator[dict]:
-        k = 8 if mode == "quick" else 30
         try:
-            # ── 1. Status: starting ─────────────────────────────────────────
+            # ── 1. Classify intent ──────────────────────────────────────────
+            yield {
+                "event": "status",
+                "data": json.dumps({"message": "🧠 Classifying query intent…"}),
+            }
+
+            intent = await classify_intent(q)
+
+            yield {
+                "event": "intent",
+                "data": json.dumps({"intent": intent}),
+            }
+
+            # ── 2. Determine spider + k ─────────────────────────────────────
+            spider_file = SPIDER_MAP[intent]
+            k           = K_MAP[intent][mode]
+
+            intent_emoji = {"VIDEO": "🎬", "IMAGE": "🖼️", "TEXT": "📄"}[intent]
+            mode_label   = "Quick search" if mode == "quick" else "Deep research"
+
             yield {
                 "event": "status",
                 "data": json.dumps({
-                    "message": f"{'🔍' if mode == 'quick' else '🔬'} "
-                               f"{'Quick search' if mode == 'quick' else 'Deep research'} — "
-                               f"launching headless browser…",
+                    "message": (
+                        f"{intent_emoji} {mode_label} — "
+                        f"launching headless browser for {intent.lower()} search…"
+                    ),
                 }),
             }
 
-            t0 = time.time()
-
-            # ── 2. Run async spider ─────────────────────────────────────────
-            posts = await scrape_reddit_async(q, k)
-            scrape_time = round(time.time() - t0, 1)
+            t0    = time.time()
+            posts = await scrape_async(q, k, spider_file)
+            elapsed = round(time.time() - t0, 1)
 
             if not posts:
                 yield {
                     "event": "error",
                     "data": json.dumps({
-                        "message": "No Reddit posts found. Reddit may be blocking the headless browser. Try again or change the query.",
+                        "message": (
+                            f"No {intent.lower()} results found. "
+                            "The headless browser may be blocked. Try a different query."
+                        ),
                     }),
                 }
                 return
 
+            # ── 3. Emit sources immediately ─────────────────────────────────
+            sources = normalize_sources(posts, intent)
+
             yield {
                 "event": "status",
                 "data": json.dumps({
-                    "message": f"📄 Scraped {len(posts)} posts in {scrape_time}s. "
-                               f"{'Synthesizing…' if mode == 'quick' else 'Running deep analysis…'}",
+                    "message": (
+                        f"✅ Found {len(posts)} {intent.lower()} results in {elapsed}s. "
+                        "Synthesizing answer…"
+                    ),
                 }),
             }
 
-            # ── 3. Send sources immediately (before LLM finishes) ───────────
-            # This lets the UI show source cards while tokens stream in
-            sources = [
-                {
-                    "index": i + 1,
-                    "title": p.get("title", ""),
-                    "url": p.get("url", ""),
-                    "subreddit": p.get("subreddit", ""),
-                    "score": p.get("score", 0),
-                }
-                for i, p in enumerate(posts)
-            ]
             yield {
                 "event": "sources",
-                "data": json.dumps({"sources": sources}),
+                "data": json.dumps({"sources": sources, "intent": intent}),
             }
 
             # ── 4. Stream LLM tokens ────────────────────────────────────────
-            prompt = (
-                _build_quick_prompt(q, posts)
-                if mode == "quick"
-                else _build_deep_prompt(q, posts)
-            )
+            prompt = build_prompt(q, posts, intent, mode)
 
             async for token in stream_llm(prompt):
                 yield {
@@ -393,9 +567,10 @@ async def search_stream(
 @app.get("/health")
 async def health():
     return {
-        "status": "ok",
+        "status":   "ok",
         "provider": LLM_PROVIDER,
-        "version": "2.0.0",
+        "version":  "4.0.0",
+        "intents":  list(SPIDER_MAP.keys()),
     }
 
 

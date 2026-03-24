@@ -23,7 +23,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" className="js-focus-visible" data-js-focus-visible="">
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
