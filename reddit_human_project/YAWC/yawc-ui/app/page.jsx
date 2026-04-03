@@ -10,10 +10,12 @@ const API = (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_API_URL)
   || "http://localhost:8000";
 
 // ── Stable chat_id per browser session ───────────────────────────────────────
-const SESSION_CHAT_ID = typeof crypto !== "undefined"
-  ? crypto.randomUUID()
-  : Math.random().toString(36).slice(2);
-
+// ── Dynamic chat_id generator ────────────────────────────────────────────────
+function generateChatId() {
+  return typeof crypto !== "undefined" 
+    ? crypto.randomUUID() 
+    : Math.random().toString(36).slice(2);
+}
 // ── Global CSS ────────────────────────────────────────────────────────────────
 if (typeof document !== "undefined" && !document.getElementById("yawc-v5-styles")) {
   const s = document.createElement("style");
@@ -233,13 +235,23 @@ function getPM(platform) {
 
 // ═════════════════════════════════════════════════════════════════════════════
 export default function YAWCApp() {
+  const [chatId,      setChatId]      = useState(generateChatId());
   const [messages,    setMessages]    = useState([]);
   const [input,       setInput]       = useState("");
   const [mode,        setMode]        = useState("quick");
   const [loading,     setLoading]     = useState(false);
   const [statusMsg,   setStatusMsg]   = useState("");
   const [teachOpen,   setTeachOpen]   = useState(false);
-  const bottomRef = useRef(null);
+
+  // Generates a new Vector DB session
+  const handleNewChat = () => {
+    if (esRef.current) esRef.current.close();
+    setChatId(generateChatId());
+    setMessages([]);
+    setInput("");
+    setStatusMsg("");
+    setLoading(false);
+  };  const bottomRef = useRef(null);
   const textRef   = useRef(null);
   const esRef     = useRef(null);
 
@@ -262,7 +274,7 @@ export default function YAWCApp() {
 
     if (esRef.current) esRef.current.close();
 
-    const url = `${API}/api/search?q=${encodeURIComponent(q)}&mode=${mode}&chat_id=${SESSION_CHAT_ID}`;
+    const url = `${API}/api/search?q=${encodeURIComponent(q)}&mode=${mode}&chat_id=${chatId}`;
     const es  = new EventSource(url);
     esRef.current = es;
 
@@ -326,7 +338,7 @@ export default function YAWCApp() {
   return (
     <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh", background: T.bg }}>
       <div style={{ height: 3, background: "linear-gradient(90deg,#ff4500,#ff9a3c,#ff6a2f,#ff4500)", backgroundSize: "300% 100%", animation: "stripe 4s linear infinite" }} />
-      <TopBar onTeach={() => setTeachOpen(true)} />
+     <TopBar onTeach={() => setTeachOpen(true)} onNewChat={handleNewChat} />
 
       <main style={{ flex: 1, display: "flex", flexDirection: "column" }}>
         {isEmpty
@@ -334,7 +346,7 @@ export default function YAWCApp() {
           : (
             <div style={{ flex: 1, maxWidth: 880, width: "100%", margin: "0 auto", padding: "36px 24px 0", display: "flex", flexDirection: "column", gap: 28 }}>
               {messages.map((m, i) => (
-                <Bubble key={m.id || i} msg={m} statusMsg={statusMsg} chatId={SESSION_CHAT_ID} />
+               <Bubble key={m.id || i} msg={m} statusMsg={statusMsg} chatId={chatId} />
               ))}
               {loading && statusMsg && !messages.some(m => m.streaming && m.content) && (
                 <ThinkingBubble msg={statusMsg} />
@@ -358,19 +370,21 @@ export default function YAWCApp() {
 }
 
 // ── Top bar ───────────────────────────────────────────────────────────────────
-function TopBar({ onTeach }) {
+function TopBar({ onTeach, onNewChat }) {
   return (
     <nav style={{ background: T.wht, borderBottom: `1px solid ${T.bdr}`, position: "sticky", top: 0, zIndex: 50 }}>
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "0 28px", height: 58, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <img src="/YAWC_LOGO.png" alt="YAWC" style={{ width: 32, height: 32, borderRadius: 7 }} />
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>          <img src="/YAWC_LOGO.png" alt="YAWC" style={{ width: 32, height: 32, borderRadius: 7 }} />
           <span style={{ fontFamily: T.head, fontSize: 27, letterSpacing: 2, color: T.ink, lineHeight: 1 }}>YAWC</span>
           <div style={{ width: 1, height: 16, background: T.bdr, margin: "0 6px" }} />
           <span style={{ fontFamily: T.mono, fontSize: 9, color: T.mut, letterSpacing: 2, textTransform: "uppercase" }}>Yet Another Web Crawler</span>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button className="icon-btn" onClick={onNewChat} title="Clear memory and start a fresh session">
+           New Chat
+          </button>
           <button className="icon-btn" onClick={onTeach} title="Open Playwright Codegen to teach YAWC a new spider">
-            🧠 Teach YAWC
+           Teach YAWC
           </button>
           <div style={{ display: "flex", alignItems: "center", gap: 7, background: T.rdim, borderRadius: 100, padding: "5px 14px" }}>
             <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#16a34a", boxShadow: "0 0 7px #16a34a" }} />
@@ -406,10 +420,10 @@ function Hero({ onPick }) {
       {/* Feature pills */}
       <div style={{ display: "flex", gap: 8, marginBottom: 18, flexWrap: "wrap", justifyContent: "center" }}>
         {[
-          { icon: "🧠", label: "RAG Memory", color: "#2e7d32", bg: "#e8f5e9", border: "#a5d6a7" },
-          { icon: "📄", label: "PDF Export", color: "#1565c0", bg: "#e3f2fd", border: "#90caf9" },
-          { icon: "🎬", label: "Video · Image · Text", color: "#ff4500", bg: "#fff0e8", border: "#ffd8c8" },
-          { icon: "🐛", label: "Trace Forensics", color: "#6a1b9a", bg: "#f3e5f5", border: "#ce93d8" },
+          { label: "RAG Memory", color: "#2e7d32", bg: "#e8f5e9", border: "#a5d6a7" },
+          { label: "PDF Export", color: "#1565c0", bg: "#e3f2fd", border: "#90caf9" },
+          {  label: "Video · Image · Text", color: "#ff4500", bg: "#fff0e8", border: "#ffd8c8" },
+          {  label: "Trace Forensics", color: "#6a1b9a", bg: "#f3e5f5", border: "#ce93d8" },
         ].map((f, i) => (
           <div key={i} style={{
             background: f.bg, color: f.color, border: `1.5px solid ${f.border}`,
@@ -910,9 +924,8 @@ function TeachModal({ onClose }) {
           <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: T.mut, lineHeight: 1 }}>✕</button>
         </div>
         <p style={{ fontSize: 13, color: T.brn, lineHeight: 1.7, marginBottom: 16 }}>
-          Opens a live Playwright browser on your machine. Interact with the target site — YAWC records your actions and generates a Scrapy spider scaffold automatically.
+          Opens a live Playwright browser on your machine. Interact with the target site. <strong style={{color: T.red}}>IMPORTANT: You MUST close the browser window when you are done</strong> for YAWC to successfully save the script and generate the spider.
         </p>
-
         <label style={{ fontSize: 12, fontFamily: T.mono, color: T.mut, letterSpacing: 1, textTransform: "uppercase" }}>Target URL</label>
         <input
           className="modal-input"
@@ -984,15 +997,15 @@ function InputBar({ value, onChange, onSend, loading, mode, setMode, textRef, st
       <div style={{ maxWidth: 880, margin: "0 auto 10px", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         <span style={{ fontFamily: T.mono, fontSize: 9, color: T.mut, letterSpacing: 2, textTransform: "uppercase" }}>MODE</span>
         {[
-          { id: "quick", icon: "⚡", label: "Quick",  hint: "~15s" },
-          { id: "deep",  icon: "🔬", label: "Deep",   hint: "~60s" },
+          { id: "quick",  label: "Quick",  hint: "~15s" },
+          { id: "deep",  label: "Deep",   hint: "~60s" },
         ].map(m => (
           <button key={m.id} className={`mode-btn${mode === m.id ? " active" : ""}`} onClick={() => setMode(m.id)} title={m.hint}>
             {m.icon} {m.label}
           </button>
         ))}
         <div style={{ flex: 1 }} />
-        <button className="icon-btn" onClick={onTeach}>🧠 Teach</button>
+        <button className="icon-btn" onClick={onTeach}> Teach</button>
         {loading && statusMsg && (
           <span style={{ fontFamily: T.mono, fontSize: 11, color: T.red, fontStyle: "italic" }}>{statusMsg}</span>
         )}
