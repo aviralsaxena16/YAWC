@@ -123,6 +123,10 @@ def _spider_scaffold(name: str, url: str, codegen: str) -> str:
         Target: {url} ({domain})
         Fill in extraction logic using the codegen output in {name}_codegen.py
         """
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+
         import scrapy
         from scrapy_playwright.page import PageMethod
         from yawc_base_spider import YAWCBaseSpider   # see spider_base_spider.py

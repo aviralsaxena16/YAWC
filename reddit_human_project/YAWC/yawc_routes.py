@@ -700,9 +700,23 @@ async def teach_spider(req: TeachRequest):
                 "message": "Codegen closed without saving. Ensure you click Record in Playwright Inspector.",
             }
         generated = out_file.read_text(encoding="utf-8")
-        scaffold = _spider_scaffold(name, req.url, generated)
+        
+        # Call the LLM to write the final spider logic!
+        loop = asyncio.get_event_loop()
+        final_spider_code = await loop.run_in_executor(
+            __import__("yawc_config").THREAD_POOL,
+            _compile_spider_with_llm,
+            name,
+            req.url,
+            generated
+        )
+        
         sc_path = out_dir / f"{name}_spider.py"
-        sc_path.write_text(scaffold, encoding="utf-8")
+        sc_path.write_text(final_spider_code, encoding="utf-8")
+        
+        # Delete the raw codegen file since we don't need it anymore
+        try: out_file.unlink()
+        except OSError: pass
         return {
             "status": "success",
             "out_file": str(out_file),
@@ -716,7 +730,119 @@ async def teach_spider(req: TeachRequest):
     except Exception as e:
         raise HTTPException(500, f"Codegen failed: {e}")
 
+def _compile_spider_with_llm(name: str, url: str, codegen: str) -> str:
+    """Uses the LLM to convert raw Playwright codegen clicks into a working Scrapy spider."""
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc
+    
+    prompt = f"""You are an expert Python Scrapy developer.
+    The user wants to generate a spider for: {url} ({domain})
+    
+    Here is the Playwright codegen of how they navigated the page:
+    ```python
+    {codegen}
+    ```
+    
+    TASK: Write a complete Scrapy spider using the `YAWCBaseSpider` template.
+    
+    CRITICAL INSTRUCTION: DO NOT use brittle CSS selectors or `page.evaluate()` to extract the data. Websites change their CSS too often.
+    Instead, you must write a `parse` method that extracts the raw innerText of the page and uses the LLM to structure the data.
+    
+    Use this exact logic inside `async def parse(self, response):`:
+    1. Grab the page text: `text = await page.evaluate("() => document.body.innerText")`
+    2. Pass that text to a local LLM call (you can use `google.generativeai` synchronously here since we are in an async thread).
+    3. The LLM prompt should be: "Extract the top search results from this raw webpage text. Return ONLY a valid JSON list of objects with keys: 'url', 'title', 'body'."
+    4. Parse the LLM's JSON response and yield the items.
+    
+    Output ONLY valid, raw Python code. Do not wrap it in markdown.
+    
+    TEMPLATE:
+    import json
+    import sys
+    from pathlib import Path
+    
+    
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    
+    import scrapy
+    from scrapy_playwright.page import PageMethod
+    from yawc_base_spider import YAWCBaseSpider
+    from yawc_config import GEMINI_KEY
+    import google.generativeai as genai
 
+    class {name.title().replace('_','')}Spider(YAWCBaseSpider):
+        name = "{name}_spider"
+
+        def __init__(self, query="", k="8", chat_id="", trace_dir="", *args, **kwargs):
+            super().__init__(query=query, k=k, chat_id=chat_id, trace_dir=trace_dir, *args, **kwargs)
+            self.start_url = "{url}"
+
+        def start_requests(self):
+            yield scrapy.Request(
+                url=self.start_url,
+                meta={{
+                    "playwright": True,
+                    "playwright_include_page": True,
+                    "playwright_page_methods": [PageMethod("wait_for_timeout", 4000)],
+                }},
+                callback=self.parse,
+                errback=self.handle_error,
+            )
+
+        async def parse(self, response):
+            page = response.meta.get("playwright_page")
+            if not page: return
+            
+            try:
+                # 1. Grab raw page text
+                raw_text = await page.evaluate("() => document.body.innerText")
+                
+                # 2. Use Gemini to extract the data cleanly
+                genai.configure(api_key=GEMINI_KEY)
+                model = genai.GenerativeModel("gemini-2.5-flash")
+                llm_prompt = f"Extract the top {{self.k}} search results from this raw webpage text. Return ONLY a valid JSON list of objects with keys: 'url', 'title', 'body'. Base URL is {domain}. Raw text: {{raw_text[:15000]}}"
+                
+                resp = model.generate_content(llm_prompt)
+                clean_json = resp.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+                
+                items = json.loads(clean_json)
+                for item in items:
+                    item["platform"] = "{name}"
+                    yield item
+                    
+            except Exception as e:
+                self.logger.error(f"LLM Extraction failed: {{e}}")
+            finally:
+                await page.close()
+    """
+    
+    try:
+        from yawc_config import LLM_PROVIDER, GEMINI_KEY, ANTHROPIC_KEY
+        if LLM_PROVIDER == "gemini" and GEMINI_KEY:
+            import google.generativeai as genai
+            genai.configure(api_key=GEMINI_KEY)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            resp = model.generate_content(prompt)
+            result = resp.text.strip()
+        elif LLM_PROVIDER == "anthropic" and ANTHROPIC_KEY:
+            import anthropic
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            msg = client.messages.create(
+                model="claude-3-5-sonnet-latest",
+                max_tokens=1500,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            result = msg.content.text.strip()
+        else:
+            return "# Error: No LLM configured to compile spider."
+            
+        # Clean up markdown if the LLM ignores instructions
+        result = result.lstrip("```python").lstrip("```").rstrip("```").strip()
+        return result
+    except Exception as e:
+        print(f"[YAWC] Spider compilation failed: {e}", flush=True)
+        return f"# LLM Compilation Failed: {e}"
+    
 @router.get("/api/traces/{chat_id}")
 def list_traces(chat_id: str):
     d = TRACE_DIR / chat_id
