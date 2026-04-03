@@ -102,7 +102,6 @@ class TeachRequest(BaseModel):
     url: str
     spider_name: str = ""
 
-
 _PDF_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -110,11 +109,11 @@ _PDF_HTML = """\
 <meta charset="UTF-8">
 <title>{title}</title>
 <style>
-body { font-family: Arial, sans-serif; margin: 32px; }
-.cover { margin-bottom: 24px; border-bottom: 2px solid #333; padding-bottom: 12px; }
-.cover-title { font-size: 26px; font-weight: bold; }
-.cover-meta { color: #555; margin-top: 8px; font-size: 0.9rem; }
-.content { margin-top: 24px; }
+body {{ font-family: Arial, sans-serif; margin: 32px; }}
+.cover {{ margin-bottom: 24px; border-bottom: 2px solid #333; padding-bottom: 12px; }}
+.cover-title {{ font-size: 26px; font-weight: bold; }}
+.cover-meta {{ color: #555; margin-top: 8px; font-size: 0.9rem; }}
+.content {{ margin-top: 24px; }}
 </style>
 </head>
 <body>
@@ -129,7 +128,6 @@ body { font-family: Arial, sans-serif; margin: 32px; }
 </body>
 </html>
 """
-
 
 def _md_to_html(md: str) -> str:
     import re
@@ -163,19 +161,25 @@ def _md_to_html(md: str) -> str:
 
 
 async def _render_pdf(html: str, out: Path) -> None:
-    from playwright.async_api import async_playwright
+    from yawc_config import THREAD_POOL
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.set_content(html, wait_until="networkidle")
-        await page.pdf(
-            path=str(out),
-            format="A4",
-            margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
-            print_background=True,
-        )
-        await browser.close()
+    def _render_pdf_sync(html: str, out: Path) -> None:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_content(html, wait_until="networkidle")
+            page.pdf(
+                path=str(out),
+                format="A4",
+                margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+                print_background=True,
+            )
+            browser.close()
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(THREAD_POOL, _render_pdf_sync, html, out)
 
 
 def _find_latest_trace(chat_id: str) -> str | None:
