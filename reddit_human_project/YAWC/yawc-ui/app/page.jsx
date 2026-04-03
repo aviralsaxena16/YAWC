@@ -214,23 +214,23 @@ const T = {
 
 // ── Platform metadata ─────────────────────────────────────────────────────────
 const PLATFORM_META = {
-  "Reddit":        { icon: "🔴", cls: "badge-reddit",        label: "Reddit" },
-  "StackOverflow": { icon: "🟠", cls: "badge-stackoverflow",  label: "Stack Overflow" },
-  "Hacker News":   { icon: "🟡", cls: "badge-hackernews",    label: "Hacker News" },
-  "Wikipedia":     { icon: "📖", cls: "badge-wikipedia",      label: "Wikipedia" },
-  "YouTube":       { icon: "▶",  cls: "badge-youtube",        label: "YouTube" },
-  "Quora":         { icon: "❓", cls: "badge-quora",          label: "Quora" },
-  "Images":        { icon: "📷", cls: "badge-unsplash",       label: "Images" },
-  "Unsplash":      { icon: "📷", cls: "badge-unsplash",       label: "Unsplash" },
-  "Pexels":        { icon: "🖼️", cls: "badge-pexels",        label: "Pexels" },
+  "Reddit":        {  cls: "badge-reddit",        label: "Reddit" },
+  "StackOverflow": {  cls: "badge-stackoverflow",  label: "Stack Overflow" },
+  "Hacker News":   {  cls: "badge-hackernews",    label: "Hacker News" },
+  "Wikipedia":     {  cls: "badge-wikipedia",      label: "Wikipedia" },
+  "YouTube":       {   cls: "badge-youtube",        label: "YouTube" },
+  "Quora":         {  cls: "badge-quora",          label: "Quora" },
+  "Images":        {  cls: "badge-unsplash",       label: "Images" },
+  "Unsplash":      {  cls: "badge-unsplash",       label: "Unsplash" },
+  "Pexels":        {  cls: "badge-pexels",        label: "Pexels" },
 };
 const INTENT_META = {
-  VIDEO: { emoji: "🎬", label: "Video Research", bg: "#fff0f0", color: "#cc0000" },
-  IMAGE: { emoji: "🖼️", label: "Image Search",   bg: "#f0f4ff", color: "#2d5be3" },
-  TEXT:  { emoji: "📄", label: "Web Research",   bg: "#fff0e8", color: "#ff4500" },
+  VIDEO: { label: "Video Research", bg: "#fff0f0", color: "#cc0000" },
+  IMAGE: {  label: "Image Search",   bg: "#f0f4ff", color: "#2d5be3" },
+  TEXT:  {  label: "Web Research",   bg: "#fff0e8", color: "#ff4500" },
 };
 function getPM(platform) {
-  return PLATFORM_META[platform] || { icon: "🌐", cls: "badge-default", label: platform || "Web" };
+  return PLATFORM_META[platform] || {  cls: "badge-default", label: platform || "Web" };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -611,7 +611,7 @@ function ActionBar({ msg, chatId }) {
         {pdfState === "loading" && (
           <span style={{ width: 12, height: 12, border: "2px solid currentColor", borderTopColor: "transparent", borderRadius: "50%", display: "inline-block", animation: "spin .65s linear infinite" }} />
         )}
-        {pdfState === "idle"    && "📥"}
+        {pdfState === "idle"    }
         {pdfState === "done"    && "✓"}
         {pdfState === "error"   && "✗"}
         {pdfState === "loading" ? " Generating PDF…"
