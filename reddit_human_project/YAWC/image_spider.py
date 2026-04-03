@@ -1,257 +1,182 @@
-"""
-YAWC Image Spider v1
-Searches for images using Unsplash (primary) with a Pinterest CSS fallback.
 
-Why Unsplash as primary:
-  - No login wall for search results
-  - Stable CSS selectors (no heavy shadow DOM)
-  - Direct high-quality image CDN URLs
-  - Permissively licensed content
-
-Why Pinterest as fallback:
-  - Broader creative/inspiration coverage
-  - Requires more aggressive JS waiting
-
-Output fields per item:
-  url        — page URL (Unsplash photo page or Pinterest pin)
-  image_url  — direct image URL (usable in <img src> and markdown)
-  alt        — descriptive alt text
-  source     — "Unsplash" | "Pinterest"
-  width      — image width (if available)
-  height     — image height (if available)
-  likes      — like/save count (or 0)
-  title      — photo title / pin title
-"""
+# ══════════════════════════════════════════════════════════════════════════════
+# image_spider.py
+# ══════════════════════════════════════════════════════════════════════════════
 
 import scrapy
 from scrapy_playwright.page import PageMethod
+from yawc_base_spider import YAWCBaseSpider
 
 
-def should_abort_request(req):
-    """Block heavyweight non-content resources."""
-    blocked_types = {
-        "media", "font",
-        "websocket", "eventsource", "manifest",
-    }
-    # Allow images — we need them to extract image src URLs
-    blocked_domains = {
+def _image_abort(req) -> bool:
+    # Images MUST be allowed — we need src URLs
+    return req.resource_type in {
+        "media", "font", "websocket", "eventsource", "manifest",
+    } or any(d in req.url for d in {
         "doubleclick.net", "googlesyndication.com",
-        "google-analytics.com", "googletagmanager.com",
-        "sentry.io", "datadog-browser-agent.com",
-    }
-    if req.resource_type in blocked_types:
-        return True
-    if any(d in req.url for d in blocked_domains):
-        return True
-    return False
+        "google-analytics.com", "sentry.io",
+    })
 
 
-class ImageSpider(scrapy.Spider):
+class ImageSpider(YAWCBaseSpider):
+    """
+    Scrapes Unsplash (primary) then Pexels (fallback) for images.
+    Both have large, easily scrapeable repositories with good alt text.
+    Avoids Pinterest which aggressively blocks headless browsers.
+    Output: url, image_url, alt, source, title, likes, platform="Image"
+    """
     name = "image_spider"
 
     custom_settings = {
-        "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
-        "DOWNLOAD_HANDLERS": {
-            "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-            "http":  "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-        },
-        "PLAYWRIGHT_BROWSER_TYPE": "chromium",
+        **YAWCBaseSpider.base_settings(concurrent=1),
+        "PLAYWRIGHT_ABORT_REQUEST": _image_abort,
+        "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 25_000,
+        # Allow images to load so we can read their src attributes
         "PLAYWRIGHT_LAUNCH_OPTIONS": {
             "headless": True,
             "args": [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions",
             ],
         },
-        "PLAYWRIGHT_ABORT_REQUEST": should_abort_request,
-        "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 25_000,
-        "CONCURRENT_REQUESTS": 1,
-        "DOWNLOAD_DELAY": 0,
-        "AUTOTHROTTLE_ENABLED": False,
-        "RETRY_TIMES": 1,
-        "LOG_LEVEL": "INFO",
     }
 
-    def __init__(self, query: str = "", k: str = "5", *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.query   = query
-        self.k       = int(k)
-        self.results = []
-
-        # Primary: Unsplash search
-        encoded = query.replace(" ", "%20")
-        self.unsplash_url  = f"https://unsplash.com/s/photos/{encoded}"
-        self.pinterest_url = f"https://www.pinterest.com/search/pins/?q={encoded}"
-
-    # ── Step 1: Try Unsplash first ────────────────────────────────────────────
     def start_requests(self):
+        encoded = self.query.replace(" ", "%20")
         yield scrapy.Request(
-            url=self.unsplash_url,
+            url=f"https://unsplash.com/s/photos/{encoded}",
             meta={
                 "playwright": True,
                 "playwright_include_page": True,
                 "playwright_page_methods": [
-                    # Wait for the image grid to hydrate
                     PageMethod("wait_for_selector", "figure", timeout=12000),
                 ],
                 "source": "unsplash",
             },
             callback=self.parse_unsplash,
-            errback=self.fallback_pinterest,
+            errback=self.fallback_pexels,
         )
 
-    # ── Unsplash parser ────────────────────────────────────────────────────────
     async def parse_unsplash(self, response):
-        page   = response.meta.get("playwright_page")
-        source = response.meta.get("source", "unsplash")
+        page = response.meta.get("playwright_page")
+        await self._start_trace(page)
 
         images = await page.evaluate(f"""
             () => {{
                 const results = [];
-                // Unsplash uses <figure> elements with a nested <img>
-                const figures = document.querySelectorAll('figure');
-                for (const fig of figures) {{
+                for (const fig of document.querySelectorAll('figure')) {{
                     if (results.length >= {self.k}) break;
-
-                    const img  = fig.querySelector('img');
+                    const img = fig.querySelector('img');
                     if (!img) continue;
-
-                    // Prefer srcset largest, fall back to src
                     let imageUrl = '';
                     if (img.srcset) {{
                         const parts = img.srcset.split(',').map(s => s.trim().split(' '));
-                        // Pick the highest resolution (last or widest)
-                        const biggest = parts.sort((a, b) => {{
-                            const wa = parseInt(a[1]) || 0;
-                            const wb = parseInt(b[1]) || 0;
-                            return wb - wa;
-                        }})[0];
-                        imageUrl = biggest?.[0] || img.src;
+                        const best  = parts.sort((a, b) =>
+                            (parseInt(b[1]) || 0) - (parseInt(a[1]) || 0))[0];
+                        imageUrl = best?.[0] || img.src;
                     }} else {{
                         imageUrl = img.src;
                     }}
-
-                    // Clean Unsplash URLs: remove cropping params, force quality
                     if (imageUrl.includes('images.unsplash.com')) {{
-                        const base = imageUrl.split('?')[0];
-                        imageUrl = base + '?w=1200&q=80&auto=format&fit=crop';
+                        imageUrl = imageUrl.split('?')[0] + '?w=1200&q=80&auto=format&fit=crop';
                     }}
-
-                    const alt   = img.alt || img.title || '';
-                    const link  = fig.querySelector('a[href*="/photos/"]');
+                    const link   = fig.querySelector('a[href*="/photos/"]');
                     const pageUrl = link ? 'https://unsplash.com' + link.getAttribute('href') : '';
-
-                    if (imageUrl && !imageUrl.startsWith('data:')) {{
+                    const alt    = img.alt || img.title || '';
+                    if (imageUrl && !imageUrl.startsWith('data:'))
                         results.push({{ imageUrl, alt, pageUrl }});
-                    }}
                 }}
                 return results;
             }}
         """)
-
         await page.close()
 
         if not images:
-            self.logger.warning("[YAWC-IMG] Unsplash returned no images — trying Pinterest")
+            self.logger.warning("[Image] Unsplash returned nothing — trying Pexels")
+            encoded = self.query.replace(" ", "+")
             yield scrapy.Request(
-                url=self.pinterest_url,
+                url=f"https://www.pexels.com/search/{encoded}/",
                 meta={
                     "playwright": True,
                     "playwright_include_page": True,
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_timeout", 6000),
-                    ],
-                    "source": "pinterest",
+                    "playwright_page_methods": [PageMethod("wait_for_timeout", 5000)],
+                    "source": "pexels",
                 },
-                callback=self.parse_pinterest,
+                callback=self.parse_pexels,
                 errback=self.handle_error,
             )
             return
 
         for item in images:
             yield {
-                "url":       item.get("pageUrl") or self.unsplash_url,
+                "url":       item.get("pageUrl") or response.url,
                 "image_url": item.get("imageUrl", ""),
                 "alt":       item.get("alt", "").strip(),
-                "source":    "Unsplash",
                 "title":     item.get("alt", "").strip(),
+                "source":    "Unsplash",
                 "likes":     0,
+                "platform":  "Image",
             }
 
-    # ── Pinterest fallback parser ─────────────────────────────────────────────
-    async def parse_pinterest(self, response):
+    async def parse_pexels(self, response):
         page = response.meta.get("playwright_page")
+        await self._start_trace(page)
 
-        # Scroll once to trigger more pins to load
-        await page.evaluate("window.scrollBy(0, 1200)")
+        await page.evaluate("window.scrollBy(0, 1400)")
         await page.wait_for_timeout(2000)
 
         images = await page.evaluate(f"""
             () => {{
                 const results = [];
-                // Pinterest pin images live in [data-test-id="pin"] or div[role="listitem"]
-                const pins = document.querySelectorAll('[data-test-id="pin-visual-wrapper"] img, div[role="listitem"] img');
-
-                for (const img of pins) {{
+                const imgs = document.querySelectorAll(
+                    'article img, [class*="photo"] img, [class*="PhotoItem"] img'
+                );
+                for (const img of imgs) {{
                     if (results.length >= {self.k}) break;
-
-                    let imageUrl = img.src || '';
-                    const alt    = img.alt || '';
-
-                    // Pinterest serves /236x/, /474x/, /736x/ — upgrade to /736x/
-                    imageUrl = imageUrl.replace(/\\/\\d+x\\//g, '/736x/');
-
-                    // Skip tiny icons / avatars
-                    if (!imageUrl || imageUrl.includes('profile') || imageUrl.includes('avatar')) continue;
-                    if (img.width < 100 || img.height < 100) continue;
-
-                    const pinLink = img.closest('a');
-                    const pageUrl = pinLink
-                        ? 'https://www.pinterest.com' + (pinLink.getAttribute('href') || '')
-                        : '';
-
-                    results.push({{ imageUrl, alt, pageUrl }});
+                    let src = img.src || '';
+                    const alt = img.alt || '';
+                    // Pexels srcset — pick largest
+                    if (img.srcset) {{
+                        const parts = img.srcset.split(',').map(s => s.trim().split(' '));
+                        const best = parts.sort((a,b) =>
+                            (parseInt(b[1]) || 0) - (parseInt(a[1]) || 0))[0];
+                        src = best?.[0] || src;
+                    }}
+                    // Skip avatars / tiny images
+                    if (!src || img.width < 100 || src.includes('avatar')) continue;
+                    const link   = img.closest('a');
+                    const pageUrl = link ? (
+                        link.href.startsWith('http') ? link.href
+                        : 'https://www.pexels.com' + link.getAttribute('href')
+                    ) : '';
+                    results.push({{ imageUrl: src, alt, pageUrl }});
                 }}
                 return results;
             }}
         """)
-
         await page.close()
 
         for item in images:
             yield {
-                "url":       item.get("pageUrl") or self.pinterest_url,
+                "url":       item.get("pageUrl") or response.url,
                 "image_url": item.get("imageUrl", ""),
                 "alt":       item.get("alt", "").strip() or self.query,
-                "source":    "Pinterest",
                 "title":     item.get("alt", "").strip() or self.query,
+                "source":    "Pexels",
                 "likes":     0,
+                "platform":  "Image",
             }
 
-    async def fallback_pinterest(self, failure):
-        """Called when Unsplash request itself errors (timeout, blocked)."""
-        self.logger.warning(f"[YAWC-IMG] Unsplash failed: {failure}. Falling back to Pinterest.")
+    async def fallback_pexels(self, failure):
+        self.logger.warning(f"[Image] Unsplash request failed — falling back to Pexels")
+        encoded = self.query.replace(" ", "+")
         yield scrapy.Request(
-            url=self.pinterest_url,
+            url=f"https://www.pexels.com/search/{encoded}/",
             meta={
                 "playwright": True,
                 "playwright_include_page": True,
-                "playwright_page_methods": [
-                    PageMethod("wait_for_timeout", 6000),
-                ],
+                "playwright_page_methods": [PageMethod("wait_for_timeout", 5000)],
             },
-            callback=self.parse_pinterest,
+            callback=self.parse_pexels,
             errback=self.handle_error,
         )
-
-    async def handle_error(self, failure):
-        self.logger.warning(f"[YAWC-IMG] ✗ All sources failed: {failure.request.url}")
-        page = failure.request.meta.get("playwright_page")
-        if page:
-            try:
-                await page.close()
-            except Exception:
-                pass
