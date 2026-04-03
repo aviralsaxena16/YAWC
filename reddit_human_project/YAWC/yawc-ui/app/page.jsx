@@ -387,8 +387,8 @@ function TopBar({ onTeach, onNewChat }) {
            Teach YAWC
           </button>
           <div style={{ display: "flex", alignItems: "center", gap: 7, background: T.rdim, borderRadius: 100, padding: "5px 14px" }}>
-            <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#16a34a", boxShadow: "0 0 7px #16a34a" }} />
-            <span style={{ fontFamily: T.mono, fontSize: 9, color: T.brn, letterSpacing: 1.5, textTransform: "uppercase" }}>live</span>
+            {/* <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#16a34a", boxShadow: "0 0 7px #16a34a" }} /> */}
+            {/* <span style={{ fontFamily: T.mono, fontSize: 9, color: T.brn, letterSpacing: 1.5, textTransform: "uppercase" }}>live</span> */}
           </div>
         </div>
       </div>
@@ -1038,8 +1038,8 @@ function InputBar({ value, onChange, onSend, loading, mode, setMode, textRef, st
       <div style={{ maxWidth: 880, margin: "7px auto 0", fontFamily: T.mono, fontSize: 9, color: T.mut, letterSpacing: .8, display: "flex", gap: 16, flexWrap: "wrap" }}>
         <span>↵ Search</span>
         <span>Shift+↵ newline</span>
-        <span>🧠 Follow-ups answered from memory</span>
-        <span>7 platforms auto-selected</span>
+        <span> Follow-ups answered from memory</span>
+        <span> 7 platforms auto-selected</span>
       </div>
     </div>
   );
