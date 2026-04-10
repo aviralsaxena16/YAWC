@@ -1,214 +1,153 @@
-# Yet Another Social Crawler
+# YAWC — Yet Another Web Crawler
 
-![License](https://img.shields.io/badge/license--blue.svg)
-![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
+> A "Deep Research" chat interface that scrapes Reddit **live** with a headless browser,  
+> feeds the results into Gemini / Claude, and streams the answer back to a slick Next.js UI.
 
-## Description
-
-# Reddit Human Scraper (Scrapy + Playwright)
-
-A robust, human-like asynchronous web scraper built with Scrapy and Playwright.  
-This tool is designed to mimic real user behavior (smooth scrolling, waiting for content hydration) to scrape deep Reddit data, including post content and nested comments, without triggering immediate bot detection.
-
----
-
-## 🚀 Features
-
-- Human-Like Scrolling: Automatically scrolls through feeds to collect a target number of posts before scraping details.
-- Shadow DOM Penetration: Uses Playwright's execution context to extract data from Reddit's modern shreddit elements.
-- Dual Mode: Supports both Anonymous scraping and Authenticated scraping (Login support).
-- Flexible Targeting: Can scrape the Home Feed, a specific Subreddit, or a User's post history.
-- Persistent Context: Maintains session cookies/local storage during the crawl to access personalized feeds.
+```
+User query → FastAPI → Scrapy + Playwright → Reddit live scrape
+         ↘ SSE status events ("Searching…", "Scraped 8 posts…")
+                            ↓ in-memory posts
+                      Gemini / Claude LLM
+                            ↓ synthesized answer
+                      Next.js chat UI (streaming SSE)
+```
 
 ---
 
-## 🛠 Installation & Setup
+## Project Structure
 
-### 1. Prerequisites
-
-Ensure you have Python 3.8+ installed.
-
-### 2. Install Dependencies
-
-Install Scrapy, the Playwright integration, and the Playwright browser binaries:
-
-pip install scrapy scrapy-playwright
-playwright install chromium
-
-### 3. Project Configuration
-
-Ensure your settings.py includes the following Playwright configurations:
-
-DOWNLOAD_HANDLERS = {
-    "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-    "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
-}
-
-TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
-
-PLAYWRIGHT_LAUNCH_OPTIONS = {"headless": False}
-
-Set headless to True if you want background execution.
+```
+yawc/
+├── reddit_spider.py   # Scrapy + Playwright spider (search-mode, no comments)
+├── main.py            # FastAPI backend (Crochet + SSE streaming)
+├── YAWCChat.jsx       # Next.js / React chat UI (drop into app/page.jsx)
+├── .env.example       # Copy to .env and fill in API keys
+└── README.md
+```
 
 ---
 
-## 🏃 Usage Guide
+## Setup
 
-Run the spider using the scrapy crawl command.  
-You can control the behavior using arguments (-a flag=value).
+### 1 — Python backend
 
----
+```bash
+# Create a virtual env
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-### 1. Anonymous Scraping (No Login)
+# Install Python deps
+pip install fastapi uvicorn scrapy scrapy-playwright \
+            crochet google-generativeai anthropic \
+            sse-starlette python-dotenv twisted
 
-Scrape the global Home feed:
+# Install Playwright browser (Chromium only — lean)
+playwright install chromium --with-deps
 
-scrapy crawl reddit_human -o home_feed.json
+# Copy env file and fill in your keys
+cp .env.example .env
 
-Scrape a specific subreddit (e.g., r/developersIndia):
+# Start the API
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-scrapy crawl reddit_human -a target=developersIndia -o dev_india.json
+### 2 — Next.js frontend
 
-Scrape a specific number of posts (e.g., 100 posts):
+```bash
+npx create-next-app@latest yawc-ui --app --typescript --tailwind
+cd yawc-ui
 
-scrapy crawl reddit_human -a target=python -a k=100 -o python_100.json
+# Drop YAWCChat.jsx into the app directory:
+cp ../YAWCChat.jsx app/page.jsx   # or app/page.tsx (rename accordingly)
 
----
+# Add the API URL to .env.local
+echo "NEXT_PUBLIC_API_URL=http://localhost:8000" >> .env.local
 
-### 2. Authenticated Scraping (With Login)
+# Run dev server
+npm run dev
+```
 
-Note:  
-Use a burner account without 2FA for best results.
-
-Scrape your personalized Home Feed:
-
-scrapy crawl reddit_human -a username="YOUR_USER" -a password="YOUR_PASSWORD" -o my_feed.json
-
-Scrape a specific Subreddit as a logged-in user:
-
-scrapy crawl reddit_human -a target=developersIndia -a username="YOUR_USER" -a password="YOUR_PASSWORD" -o auth_dev_india.json
-
----
-
-## ⚙ Arguments Reference
-
-Argument    | Description                                                        | Default
------------ | ------------------------------------------------------------------ | ----------------
-target      | The subreddit name (without r/) or leave empty for Home Feed      | None (Home Feed)
-k           | Number of posts to scroll and collect before scraping details     | 50
-username    | Reddit username for authentication                                 | None
-password    | Reddit password for authentication                                 | None
+Open **http://localhost:3000** — done.
 
 ---
 
-## 📂 Output Structure
+## How It Works
 
-The scraper exports data to JSON with the following structure:
+### Why Crochet instead of subprocess?
 
-[
-    {
-        "url": "https://www.reddit.com/r/example/comments/...",
-        "title": "Example Post Title",
-        "body": [
-            "This is the content of the post...",
-            "More paragraphs..."
-        ],
-        "comments": [
-            "First comment",
-            "Second comment",
-            "Reply to comment..."
-        ]
-    }
-]
+Scrapy is built on the Twisted async framework.  
+FastAPI is built on asyncio.  
+The two reactors **cannot coexist in the same thread**, and Twisted's reactor  
+**cannot be restarted** once stopped (`ReactorNotRestartable` error).
 
----
+**Crochet** solves this by running the Twisted reactor in a dedicated background thread
+and exposing a clean `@crochet.run_in_reactor` decorator. The FastAPI thread calls
+`eventual.wait()` which blocks only a thread pool worker — the asyncio event loop stays free.
 
-## ⚠ Troubleshooting
+```
+FastAPI thread          Twisted reactor thread (Crochet)
+─────────────           ──────────────────────────────────
+run_in_executor  ──────► @run_in_reactor → CrawlerRunner.crawl()
+eventual.wait()  ◄──────  Deferred resolves when crawl finishes
+return posts             (reactor keeps running for next request)
+```
 
-### 1. "Connection closed while reading from driver"
+### In-Memory Handoff (zero disk I/O)
 
-Cause:  
-The browser was closed manually or crashed due to memory issues.
+The spider receives a `result_collector: list` reference on construction.
+In `parse_post`, it calls `self.result_collector.append(post_data)`.
+The same list object is passed in from `main.py` and read after crawl completion.
+**No JSON files, no temp files, no subprocess pipes.**
 
-Fix:
+### SSE Streaming (live status updates)
 
-- Ensure try/except blocks are around await page.close()
-- Reduce concurrency in settings.py:
+The `/api/search` endpoint returns a `EventSourceResponse` and streams three event types:
 
-CONCURRENT_REQUESTS = 1
+| Event    | When                                     | Payload                         |
+|----------|------------------------------------------|---------------------------------|
+| `status` | During scraping / synthesis              | `{ message: "..." }`           |
+| `result` | Done — full answer ready                 | `{ answer, sources[] }`        |
+| `error`  | Scrape failed / no posts found           | `{ message: "..." }`           |
 
----
-
-### 2. "ReactorNotRestartable" or Asyncio Errors
-
-Cause:  
-Windows-specific event loop issue.
-
-Fix:  
-Ensure this code block is at the top of your reddit_spider.py:
-
-import asyncio
-try:
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-except AttributeError:
-    pass
+The Next.js UI connects with the native browser `EventSource` API — no libraries needed.
 
 ---
 
-### 3. Login Fails
+## Latency Optimization Techniques
 
-Cause:  
-Reddit triggered CAPTCHA or 2FA request.
+| Technique | Saving |
+|-----------|--------|
+| `PLAYWRIGHT_ABORT_REQUEST` blocks images, fonts, CSS, media | ~60% page load time |
+| No `shreddit-comment` wait — skip comments entirely | ~2–4s per post |
+| `CONCURRENT_REQUESTS: 8` — all posts fetched in parallel | Linear → parallel |
+| `RETRY_TIMES: 1` — fail fast, don't retry forever | Removes long tail |
+| `AUTOTHROTTLE_ENABLED: False` — no artificial rate limiting | Removes delay jitter |
+| `DOWNLOAD_DELAY: 0` — no wait between requests | Removes constant delay |
+| In-memory handoff — no disk write/read round-trip | ~10–50ms |
+| `k=8` by default — only top 8 posts scraped | Caps total scrape time |
+| `--blink-settings=imagesEnabled=false` Chromium flag | Extra insurance |
+| Body text capped at 800 chars per post in prompt | Smaller LLM prompt = faster |
 
-Fix:
-
-- The script cannot bypass CAPTCHA
-- Use an account that doesn’t trigger it
-- Or switch to Anonymous mode
-
----
-
-## ⚖ Disclaimer
-
-- This tool is for educational and research purposes only.
-- Respect Reddit's robots.txt (enable ROBOTSTXT_OBEY = True if required).
-- Do not use this tool to spam or harass users.
-- Be mindful of Reddit's Terms of Service.
+**Typical end-to-end latency:** 8–18 seconds  
+(3–6s scrape + 2–5s Gemini synthesis + SSE overhead)
 
 ---
 
-## Table of Contents
+## Configuration
 
-- Installation
-- Usage
-- Contributing
-- License
-- Contact
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `LLM_PROVIDER` | `gemini` | `gemini` or `anthropic` |
+| `GEMINI_API_KEY` | — | Your Google AI Studio key |
+| `ANTHROPIC_API_KEY` | — | Your Anthropic key |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Backend URL for the Next.js UI |
 
----
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the project  
-2. Create your feature branch (git checkout -b feature/AmazingFeature)  
-3. Commit your changes (git commit -m 'Add some AmazingFeature')  
-4. Push to the branch (git push origin feature/AmazingFeature)  
-5. Open a Pull Request  
+Change `k` (number of posts) in `scrape_reddit_sync(query, k=8)` in `main.py`.
 
 ---
 
-## License
+## Notes & Caveats
 
-This project is licensed under the MIT License.  
-See the LICENSE file for details.
-
----
-
-## Contact
-
-Aviral Saxena  
-
-Project Link:  
-https://github.com/aviralsaxena16/YARS.git
+- Reddit may block headless Chromium. If scraping fails, try enabling `headless: False` temporarily to debug.
+- For production, add request headers to mimic a real browser via `PLAYWRIGHT_DEFAULT_NAVIGATION_OPTIONS`.
+- The Gemini `gemini-2.5-flash` model is recommended for speed. Swap to `gemini-2.0-pro` for quality.
+- YAWC is for personal/research use. Always respect Reddit's Terms of Service.
