@@ -97,11 +97,11 @@ _REDDIT_EXTRACT_JS = """
 
 class RedditSpider(YAWCBaseSpider):
     """
-    Scrapes Reddit search results anonymously (no login required).
+    Scrapes Reddit home page anonymously (no login required).
 
     Usage:
-        scrapy crawl reddit_spider -a query="mechanical keyboards" -a k=50
-        scrapy crawl reddit_spider -a query="python tips" -a k=100 -a headless=false
+        scrapy crawl reddit_spider -a k=50
+        scrapy crawl reddit_spider -a headless=false
     """
 
     name = "reddit_spider"
@@ -125,10 +125,8 @@ class RedditSpider(YAWCBaseSpider):
     }
 
     def start_requests(self):
-        import urllib.parse
-        encoded = urllib.parse.quote(self.query)
-        url = f"https://www.reddit.com/search/?q={encoded}&sort=relevance"
-        self.logger.info(f"[Reddit] Unauthenticated search → {url}")
+        url = "https://www.reddit.com/"
+        self.logger.info(f"[Reddit] Home page crawl → {url}")
 
         yield scrapy.Request(
             url=url,

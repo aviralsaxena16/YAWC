@@ -107,11 +107,11 @@ _QUORA_EXTRACT_JS = """
 
 class QuoraSpider(YAWCBaseSpider):
     """
-    Scrapes Quora search results using the m-b session cookie.
+    Scrapes Quora home page using the m-b session cookie.
 
     Usage:
-        scrapy crawl quora_spider -a query="how to learn python" -a k=30
-        scrapy crawl quora_spider -a query="career advice" -a k=50 -a headless=false
+        scrapy crawl quora_spider -a k=30
+        scrapy crawl quora_spider -a headless=false
     """
 
     name = "quora_spider"
@@ -139,8 +139,6 @@ class QuoraSpider(YAWCBaseSpider):
     }
 
     def start_requests(self):
-        import urllib.parse
-
         if not _QUORA_M_B:
             self.logger.error(
                 "❌  QUORA_M_B not set in .env.\n"
@@ -148,9 +146,8 @@ class QuoraSpider(YAWCBaseSpider):
             )
             return
 
-        encoded = urllib.parse.quote(self.query)
-        url = f"https://www.quora.com/search?q={encoded}&type=question"
-        self.logger.info(f"[Quora] Cookie-auth search → {url}")
+        url = "https://www.quora.com/"
+        self.logger.info(f"[Quora] Cookie-auth home crawl → {url}")
 
         yield scrapy.Request(
             url=url,
@@ -191,11 +188,11 @@ class QuoraSpider(YAWCBaseSpider):
         page = response.meta.get("playwright_page")
         await self._start_trace(page)
 
-        # Verify we actually landed on the search page, not the login page
+        # Verify we actually landed on a logged-in Quora page, not the login page
         current_url = page.url
-        if "/search" not in current_url:
+        if "login" in current_url or "signin" in current_url:
             self.logger.error(
-                f"[Quora] Landed on {current_url} instead of search page.\n"
+                f"[Quora] Landed on {current_url} instead of the home page.\n"
                 "        Your QUORA_M_B cookie may be expired – re-extract it from Chrome."
             )
             await page.close()

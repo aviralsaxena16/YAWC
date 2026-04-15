@@ -6,6 +6,7 @@
 
 import asyncio
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -22,7 +23,7 @@ TARGET_ITEMS  = 50
 MAX_SCROLLS   = 15
 SCROLL_DELTA  = 2500
 SCROLL_PAUSE  = 2500       # ms – Reddit/Quora need time to hydrate
-PAGE_TIMEOUT  = 45_000
+PAGE_TIMEOUT  = 60_000
 INITIAL_WAIT  = 4_000      # ms after DOMContentLoaded before we start counting
 
 USER_AGENT = (
@@ -55,12 +56,14 @@ def _build_targets() -> list[Platform]:
             twitter_cookies.append({
                 "name": "auth_token", "value": auth_token,
                 "domain": domain, "path": "/", "secure": True, "httpOnly": True,
+                "sameSite": "None",
             })
     if ct0_token:
         for domain in [".twitter.com", ".x.com"]:
             twitter_cookies.append({
                 "name": "ct0", "value": ct0_token,
                 "domain": domain, "path": "/", "secure": True,
+                "sameSite": "None",
             })
 
     # ── Quora cookie ───────────────────────────────────────────────────────
@@ -85,7 +88,7 @@ def _build_targets() -> list[Platform]:
         # We evaluate JS that tries ALL variants and returns the max.
         Platform(
             name      = "Reddit",
-            url       = "https://www.reddit.com/search/?q=best+mechanical+keyboard&sort=relevance",
+            url       = "https://www.reddit.com/",
             js_count  = """
                 (function() {
                     const counts = [
@@ -106,7 +109,7 @@ def _build_targets() -> list[Platform]:
         # The m-b session cookie is required.
         Platform(
             name      = "Quora",
-            url       = "https://www.quora.com/search?q=how+to+learn+python&type=question",
+            url       = "https://www.quora.com/",
             js_count  = """
                 (function() {
                     const links = document.querySelectorAll(
@@ -133,7 +136,7 @@ def _build_targets() -> list[Platform]:
         # ── Twitter / X ───────────────────────────────────────────────────
         Platform(
             name      = "Twitter",
-            url       = "https://x.com/search?q=Artificial+Intelligence&src=typed_query&f=live",
+            url       = "https://x.com/home",
             js_count  = 'document.querySelectorAll(\'[data-testid="tweet"]\').length',
             auth_note  = ("Cookie (TWITTER_AUTH_TOKEN)" if auth_token
                           else "⚠ No TWITTER_AUTH_TOKEN set → will be blocked"),
@@ -173,6 +176,7 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
                 headless=headless,
                 args=[
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
                     "--disable-gpu",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
@@ -185,7 +189,11 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
                 "viewport":   {"width": 1280, "height": 900},
                 "locale":     "en-US",
                 "timezone_id":"America/New_York",
-                "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+                "extra_http_headers": {
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.google.com/",
+                    "DNT": "1",
+                },
             }
 
             if platform.cookies:
@@ -205,12 +213,26 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
 
             page: Page = await ctx.new_page()
 
+            async def _goto(url: str):
+                try:
+                    return await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+                except Exception:
+                    await page.wait_for_timeout(1_000)
+                    return await page.goto(url, timeout=PAGE_TIMEOUT * 2, wait_until="domcontentloaded")
+
             try:
-                await page.goto(
-                    platform.url,
-                    timeout=PAGE_TIMEOUT,
-                    wait_until="domcontentloaded",
-                )
+                if platform.name == "Twitter":
+                    await _goto("https://x.com/home")
+                    await page.wait_for_timeout(5_000)
+                    try:
+                        await page.mouse.move(100, 100)
+                        await page.mouse.wheel(0, 500)
+                    except Exception:
+                        pass
+                    if platform.url != "https://x.com/home":
+                        await _goto(platform.url)
+                else:
+                    await _goto(platform.url)
 
                 # ── Block / login-wall detection ──────────────────────────
                 title       = (await page.title()).lower()
@@ -241,34 +263,48 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
                     if platform.name == "Twitter":
                         try:
                             await page.wait_for_selector(
-                                "[data-testid='tweet']", timeout=25_000, state="attached"
+                                "[data-testid='tweet'], article",
+                                timeout=40_000,
+                                state="attached",
                             )
                         except Exception:
                             pass
 
                     elif platform.name == "Reddit":
-                        # Try multiple selectors – whichever appears first wins
-                        for sel in [
-                            "[data-testid='post-container']",
-                            "article",
-                            "shreddit-post",
-                            "[data-click-id='body']",
-                        ]:
+                        await page.wait_for_selector(
+                            "[data-testid='post-container'], article, shreddit-post",
+                            timeout=10_000,
+                            state="attached",
+                        )
+
+                    # ── Prevent Reddit auto-navigation during scrolling ──────
+                    if platform.name == "Reddit":
+                        try:
+                            await page.evaluate("""
+                                window.history.pushState = () => {};
+                                window.location.assign = () => {};
+                            """)
+                        except Exception:
+                            pass
+
+                    await page.wait_for_timeout(2_000 + int(2_000 * random.random()))
+
+                    async def _safe_evaluate(js_expr: str):
+                        try:
+                            return await page.evaluate(js_expr)
+                        except Exception:
+                            await page.wait_for_timeout(2_000)
                             try:
-                                await page.wait_for_selector(sel, timeout=6_000, state="attached")
-                                break
+                                return await page.evaluate(js_expr)
                             except Exception:
-                                continue
+                                return None
 
                     # ── Scroll loop ───────────────────────────────────────
                     prev_count  = 0
                     stall_count = 0
 
                     for _ in range(MAX_SCROLLS):
-                        try:
-                            items_found = int(await page.evaluate(platform.js_count) or 0)
-                        except Exception:
-                            items_found = 0
+                        items_found = int(await _safe_evaluate(platform.js_count) or 0)
 
                         if items_found >= TARGET_ITEMS:
                             break
@@ -285,10 +321,7 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
                         await page.wait_for_timeout(SCROLL_PAUSE)
 
                     # Final read
-                    try:
-                        items_found = int(await page.evaluate(platform.js_count) or 0)
-                    except Exception:
-                        pass
+                    items_found = int(await _safe_evaluate(platform.js_count) or 0)
 
             except Exception as exc:
                 result.error = str(exc)[:150]

@@ -89,11 +89,11 @@ _TWITTER_EXTRACT_JS = """
 
 class TwitterSpider(YAWCBaseSpider):
     """
-    Scrapes Twitter/X search – session cookie injected silently, no login UI.
+    Scrapes Twitter/X home page – session cookie injected silently, no login UI.
 
     Usage:
-        scrapy crawl twitter_spider -a query="Artificial Intelligence" -a k=50
-        scrapy crawl twitter_spider -a query="LLMs" -a k=80 -a headless=false
+        scrapy crawl twitter_spider -a k=50
+        scrapy crawl twitter_spider -a headless=false
     """
 
     name = "twitter_spider"
@@ -121,7 +121,6 @@ class TwitterSpider(YAWCBaseSpider):
     }
 
     def start_requests(self):
-        import urllib.parse
         if not _AUTH_TOKEN:
             self.logger.error(
                 "❌  TWITTER_AUTH_TOKEN not set in .env.\n"
@@ -129,9 +128,8 @@ class TwitterSpider(YAWCBaseSpider):
             )
             return
 
-        encoded = urllib.parse.quote(self.query)
-        url = f"https://x.com/search?q={encoded}&src=typed_query&f=live"
-        self.logger.info(f"[Twitter] Cookie-auth search → {url}")
+        url = "https://x.com/home"
+        self.logger.info(f"[Twitter] Cookie-auth home crawl → {url}")
 
         yield scrapy.Request(
             url=url,
