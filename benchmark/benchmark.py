@@ -240,9 +240,8 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
 
                 is_blocked = (
                     any(t in title for t in ["just a moment", "attention required", "captcha"])
-                    or ("login" in current_url and platform.name != "Twitter")
-                    or ("signin" in current_url)
-                    or (platform.name == "Quora" and "/search" not in current_url)
+                    or ("login" in current_url)
+                    or ("signup" in current_url)
                 )
 
                 if is_blocked:
