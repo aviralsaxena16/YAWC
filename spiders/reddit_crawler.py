@@ -454,7 +454,7 @@ SCRAPY_SETTINGS = {
     "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
     "PLAYWRIGHT_BROWSER_TYPE": "chromium",
     "PLAYWRIGHT_LAUNCH_OPTIONS": {
-        "headless": True,
+        "headless": False,
         "args": [
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -485,7 +485,7 @@ SCRAPY_SETTINGS = {
         },
     },
     "CONCURRENT_REQUESTS":             4,
-    "DOWNLOAD_DELAY":                  3,
+    "DOWNLOAD_DELAY":                  6,
     "RANDOMIZE_DOWNLOAD_DELAY":        True,
     "AUTOTHROTTLE_ENABLED":            True,
     "AUTOTHROTTLE_START_DELAY":        3,
