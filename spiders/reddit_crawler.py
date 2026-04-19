@@ -147,7 +147,7 @@ class HumanRedditSpider(scrapy.Spider):
         self._last_stats_log = time.time()
 
         if target:
-            self.start_url   = f"https://www.reddit.com/r/{target}/"
+            self.start_url   = f"https://www.reddit.com/"
             self.target_name = f"r/{target}"
         else:
             self.start_url   = "https://www.reddit.com/"
