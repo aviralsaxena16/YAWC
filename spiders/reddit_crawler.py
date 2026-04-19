@@ -134,6 +134,8 @@ class HumanRedditSpider(scrapy.Spider):
         "[data-testid='post-container']",
         ".Post",
         "div[data-fullname]",
+        "a[data-click-id='body']",
+        "a[href*='/comments/']",
     ]
 
     def __init__(self, target=None, username=None, password=None, *args, **kwargs):
@@ -241,6 +243,16 @@ class HumanRedditSpider(scrapy.Spider):
         feed_sel = await self._detect_feed_selector(page)
 
         if not feed_sel:
+            if self.start_url.startswith("https://www.reddit.com/"):
+                old_url = self.start_url.replace("www.reddit.com", "old.reddit.com")
+                self._log(f"[FEED] No selector matched on new Reddit, retrying with old Reddit: {old_url}", "warning")
+                try:
+                    await page.goto(old_url, wait_until="networkidle", timeout=30000)
+                    feed_sel = await self._detect_feed_selector(page)
+                except Exception as exc:
+                    self._log(f"[FEED] Old Reddit navigation failed: {exc}", "warning")
+
+        if not feed_sel:
             # Save screenshot + page source snippet for debugging
             ss_path = LOG_DIR / f"feed_debug_{int(time.time())}.png"
             try:
@@ -268,7 +280,7 @@ class HumanRedditSpider(scrapy.Spider):
 
             // fallback: anchor tags used in old/transitional new-Reddit
             if (links.length === 0) {{
-                links = Array.from(document.querySelectorAll('a[data-click-id="body"]'))
+                links = Array.from(document.querySelectorAll('a[data-click-id="body"], a[href*="/comments/"]'))
                     .map(a => a.getAttribute('href'))
                     .filter(l => l && l.startsWith('/r/'));
             }}
