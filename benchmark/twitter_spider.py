@@ -1,3 +1,7 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# twitter_spider.py  –  FINAL STABLE VERSION (HOME + FOLLOWING TAB)
+# ══════════════════════════════════════════════════════════════════════════════
+
 import os
 import scrapy
 from scrapy_playwright.page import PageMethod
@@ -12,8 +16,8 @@ _CT0_TOKEN  = os.getenv("TWITTER_CT0_TOKEN", "").strip()
 # ── Cookies ─────────────────────────────────────────────
 _SESSION_COOKIES = []
 
-if _AUTH_TOKEN:
-    for domain in [".x.com", ".twitter.com"]:
+for domain in [".x.com", ".twitter.com"]:
+    if _AUTH_TOKEN:
         _SESSION_COOKIES.append({
             "name": "auth_token",
             "value": _AUTH_TOKEN,
@@ -24,8 +28,7 @@ if _AUTH_TOKEN:
             "sameSite": "None",
         })
 
-if _CT0_TOKEN:
-    for domain in [".x.com", ".twitter.com"]:
+    if _CT0_TOKEN:
         _SESSION_COOKIES.append({
             "name": "ct0",
             "value": _CT0_TOKEN,
@@ -36,7 +39,7 @@ if _CT0_TOKEN:
         })
 
 
-# ── Extraction JS ───────────────────────────────────────
+# ── JS Extractor ───────────────────────────────────────
 _TWITTER_EXTRACT_JS = """
 (limit) => {
     const results = [];
@@ -48,19 +51,24 @@ _TWITTER_EXTRACT_JS = """
         if (results.length >= limit) break;
 
         const textEl = t.querySelector('[data-testid="tweetText"]');
-        const text = textEl ? textEl.innerText : "";
+        const text = textEl ? textEl.innerText.trim() : "";
 
-        const link = t.querySelector('a[href*="/status/"]');
-        if (!text || !link) continue;
+        const timeEl = t.querySelector("time");
+        const linkEl = timeEl ? timeEl.closest("a") : null;
 
-        const url = "https://x.com" + link.getAttribute("href");
+        if (!text || !linkEl) continue;
+
+        const url = "https://x.com" + linkEl.getAttribute("href");
 
         if (seen.has(url)) continue;
         seen.add(url);
 
+        const user = t.querySelector('[data-testid="User-Name"]');
+        const title = user ? user.innerText.split("\\n")[0] : "Unknown";
+
         results.push({
             url,
-            title: text.split("\\n")[0],
+            title,
             body: text
         });
     }
@@ -70,28 +78,31 @@ _TWITTER_EXTRACT_JS = """
 """
 
 
+def _abort(req):
+    return req.resource_type in {"image", "media", "font", "stylesheet"}
+
+
 class TwitterSpider(YAWCBaseSpider):
     name = "twitter_spider"
 
     custom_settings = {
         **YAWCBaseSpider.base_settings(concurrent=2),
+        "PLAYWRIGHT_ABORT_REQUEST": _abort,
         "PLAYWRIGHT_CONTEXTS": {
             "default": {
                 "storage_state": {"cookies": _SESSION_COOKIES, "origins": []},
-                "extra_http_headers": {
-                    "Referer": "https://x.com/",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0",
             }
         },
     }
 
-    # ── Start directly on SEARCH ─────────────────────────
     def start_requests(self):
-        url = f"https://x.com/search?q={self.query}&src=typed_query&f=live"
+        if not _AUTH_TOKEN:
+            self.logger.error("❌ Missing TWITTER_AUTH_TOKEN")
+            return
 
         yield scrapy.Request(
-            url=url,
+            url="https://x.com/home",
             meta={
                 "playwright": True,
                 "playwright_include_page": True,
@@ -102,67 +113,71 @@ class TwitterSpider(YAWCBaseSpider):
             callback=self.parse,
         )
 
-    # ── Main parsing ─────────────────────────────────────
     async def parse(self, response):
         page = response.meta["playwright_page"]
 
-        # 🔥 Step 1: Handle spinner (retry loop)
+        # 🔥 FIX 1: Spinner killer
         for _ in range(3):
-            try:
-                spinner = page.locator('[role="progressbar"]')
-
-                if await spinner.count() > 0:
-                    self.logger.info("[Twitter] Spinner → reload")
-                    await page.reload(wait_until="domcontentloaded")
-                    await page.wait_for_timeout(5000)
-                else:
-                    break
-            except Exception:
+            spinner = page.locator('[role="progressbar"]')
+            if await spinner.count() > 0:
+                await page.reload()
+                await page.wait_for_timeout(5000)
+            else:
                 break
 
-        # 🔥 Step 2: fake human interaction
+        # 🔥 FIX 2: Click FOLLOWING tab (CRITICAL)
         try:
-            await page.mouse.move(200, 200)
-            await page.mouse.wheel(0, 800)
-            await page.wait_for_timeout(2000)
+            following = page.locator("text=Following")
+            if await following.count() > 0:
+                await following.first.click()
+                await page.wait_for_timeout(5000)
         except:
-            pass
+            self.logger.warning("Could not click Following tab")
 
-        # 🔥 Step 3: wait for tweets
+        # 🔥 FIX 3: Human behavior
+        await page.mouse.move(200, 200)
+        await page.mouse.wheel(0, 1000)
+        await page.wait_for_timeout(2000)
+
+        # Wait for tweets
         try:
-            await page.wait_for_selector("article", timeout=30000)
-        except Exception:
-            self.logger.warning("[Twitter] Tweets not detected yet")
+            await page.wait_for_selector("article", timeout=20000)
+        except:
+            self.logger.warning("Tweets not loaded")
 
         collected = []
         seen = set()
 
-        # 🔥 Step 4: scroll + extract
-        for _ in range(20):
-            try:
-                tweets = await page.evaluate(_TWITTER_EXTRACT_JS, self.k)
-            except Exception:
-                await page.wait_for_timeout(3000)
-                continue
+        scroll_round = 0
+        max_scrolls = 20
+        stall = 0
+
+        while len(collected) < self.k and scroll_round < max_scrolls:
+
+            tweets = await page.evaluate(_TWITTER_EXTRACT_JS, self.k)
 
             new_count = 0
             for t in tweets:
-                if t["url"] not in seen and len(collected) < self.k:
+                if t["url"] not in seen:
                     seen.add(t["url"])
                     collected.append(t)
                     new_count += 1
 
-            self.logger.info(f"[Twitter SEARCH] +{new_count} tweets (total {len(collected)})")
+            if new_count == 0:
+                stall += 1
+            else:
+                stall = 0
 
-            if len(collected) >= self.k:
+            if stall >= 3:
                 break
 
+            scroll_round += 1
+
             await page.mouse.wheel(0, 3000)
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(3000)
 
         await page.close()
 
-        # ── Yield results ────────────────────────────────
         for item in collected:
             yield {
                 "url": item["url"],

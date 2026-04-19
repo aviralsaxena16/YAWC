@@ -70,7 +70,7 @@ class QuoraSpider(YAWCBaseSpider):
     }
 
     def start_requests(self):
-        url = f"https://www.quora.com/search?q={self.query}"
+        url = "https://www.quora.com/"
 
         yield scrapy.Request(
             url=url,
@@ -98,12 +98,15 @@ class QuoraSpider(YAWCBaseSpider):
 
         collected = []
         seen = set()
+        scroll_round = 0
+        max_scrolls = 40
 
-        for _ in range(15):
+        while len(collected) < self.k and scroll_round < max_scrolls:
             try:
                 data = await page.evaluate(_QUORA_EXTRACT_JS, self.k)
-            except:
+            except Exception:
                 await page.wait_for_timeout(2000)
+                scroll_round += 1
                 continue
 
             for d in data:
@@ -111,11 +114,13 @@ class QuoraSpider(YAWCBaseSpider):
                     seen.add(d["url"])
                     collected.append(d)
 
+            scroll_round += 1
+
             if len(collected) >= self.k:
                 break
 
-            await page.mouse.wheel(0, 2000)
-            await page.wait_for_timeout(2000)
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(3000)
 
         await page.close()
 

@@ -20,9 +20,9 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 
 TARGET_ITEMS  = 50
-MAX_SCROLLS   = 15
+MAX_SCROLLS   = 40
 SCROLL_DELTA  = 2500
-SCROLL_PAUSE  = 2500       # ms – Reddit/Quora need time to hydrate
+SCROLL_PAUSE  = 3500       # ms – Reddit/Quora need time to hydrate
 PAGE_TIMEOUT  = 60_000
 INITIAL_WAIT  = 4_000      # ms after DOMContentLoaded before we start counting
 
@@ -82,23 +82,18 @@ def _build_targets() -> list[Platform]:
 
     return [
         # ── Reddit ────────────────────────────────────────────────────────
-        # Anonymous scraping works. The selector varies:
-        #   - Logged-in new Reddit:  shreddit-post (web component)
-        #   - Anonymous new Reddit:  [data-testid="post-container"] or <article>
-        # We evaluate JS that tries ALL variants and returns the max.
         Platform(
             name      = "Reddit",
             url       = "https://www.reddit.com/",
             js_count  = """
                 (function() {
-                    const counts = [
-                        document.querySelectorAll('[data-testid="post-container"]').length,
-                        document.querySelectorAll('article').length,
-                        document.querySelectorAll('shreddit-post').length,
-                        document.querySelectorAll('[data-fullname]').length,
-                        document.querySelectorAll('div[data-click-id="body"]').length,
-                    ];
-                    return Math.max(...counts);
+                    const urls = [];
+                    // Handle both new Reddit formats and web components
+                    document.querySelectorAll('[data-testid="post-container"] a[data-click-id="body"], article a[data-click-id="body"], shreddit-post, a[href*="/comments/"]').forEach(el => {
+                        const href = el.getAttribute('permalink') || el.getAttribute('href');
+                        if (href) urls.push(href);
+                    });
+                    return urls;
                 })()
             """,
             auth_note = "Anonymous",
@@ -112,14 +107,18 @@ def _build_targets() -> list[Platform]:
             url       = "https://www.quora.com/",
             js_count  = """
                 (function() {
+                    const urls = [];
                     const links = document.querySelectorAll(
                         'a[href*="/What"], a[href*="/How"], a[href*="/Why"], ' +
                         'a[href*="/Is-"], a[href*="/Are-"], a[href*="/Can-"], a[href*="/Should"]'
                     );
-                    return Array.from(links).filter(l => {
+                    links.forEach(l => {
                         const t = l.textContent.trim();
-                        return t.length > 15 && !l.href.includes('#');
-                    }).length;
+                        if (t.length > 15 && !l.href.includes('#')) {
+                            urls.push(l.href);
+                        }
+                    });
+                    return urls;
                 })()
             """,
             auth_note  = ("Cookie (QUORA_M_B)" if quora_m_b
@@ -137,7 +136,15 @@ def _build_targets() -> list[Platform]:
         Platform(
             name      = "Twitter",
             url       = "https://x.com/home",
-            js_count  = 'document.querySelectorAll(\'[data-testid="tweet"]\').length',
+            js_count  = """
+                (function() {
+                    const urls = [];
+                    document.querySelectorAll('article a[href*="/status/"]').forEach(a => {
+                        urls.push(a.href);
+                    });
+                    return urls;
+                })()
+            """,
             auth_note  = ("Cookie (TWITTER_AUTH_TOKEN)" if auth_token
                           else "⚠ No TWITTER_AUTH_TOKEN set → will be blocked"),
             cookies    = twitter_cookies,
@@ -223,10 +230,20 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
             try:
                 if platform.name == "Twitter":
                     await _goto("https://x.com/home")
-                    await page.wait_for_timeout(5_000)
+                    await page.wait_for_timeout(8_000)
                     try:
                         await page.mouse.move(100, 100)
+                        await page.mouse.click(100, 100)
                         await page.mouse.wheel(0, 500)
+                        await page.evaluate("window.scrollBy(0, 500)")
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_selector(
+                            "article a[href*='/status/'], article",
+                            timeout=60_000,
+                            state="attached",
+                        )
                     except Exception:
                         pass
                     if platform.url != "https://x.com/home":
@@ -262,8 +279,8 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
                     if platform.name == "Twitter":
                         try:
                             await page.wait_for_selector(
-                                "[data-testid='tweet'], article",
-                                timeout=40_000,
+                                "article a[href*='/status/'], article",
+                                timeout=60_000,
                                 state="attached",
                             )
                         except Exception:
@@ -298,29 +315,28 @@ async def run_scrape(platform: Platform, headless: bool) -> BenchResult:
                             except Exception:
                                 return None
 
-                    # ── Scroll loop ───────────────────────────────────────
-                    prev_count  = 0
-                    stall_count = 0
+                    # ── Scroll loop (Python State Tracking) ─────────────────────────────────
+                    scroll_round = 0
+                    max_scrolls  = MAX_SCROLLS
+                    seen_urls = set()
 
-                    for _ in range(MAX_SCROLLS):
-                        items_found = int(await _safe_evaluate(platform.js_count) or 0)
+                    while len(seen_urls) < TARGET_ITEMS and scroll_round < max_scrolls:
+                        # Extract the array of URLs currently visible in the DOM
+                        current_urls = await _safe_evaluate(platform.js_count) or []
 
-                        if items_found >= TARGET_ITEMS:
+                        # Add them to our Python set (this bypasses Twitter's Virtual DOM)
+                        for u in current_urls:
+                            seen_urls.add(u)
+
+                        if len(seen_urls) >= TARGET_ITEMS:
                             break
 
-                        if items_found == prev_count:
-                            stall_count += 1
-                            if stall_count >= 4:
-                                break
-                        else:
-                            stall_count = 0
+                        scroll_round += 1
+                        await page.mouse.wheel(0, 3500)
+                        await page.wait_for_timeout(3_000)
 
-                        prev_count = items_found
-                        await page.mouse.wheel(0, SCROLL_DELTA)
-                        await page.wait_for_timeout(SCROLL_PAUSE)
-
-                    # Final read
-                    items_found = int(await _safe_evaluate(platform.js_count) or 0)
+                    # Strict capping: If Reddit grabs 80, we only care about the time it took to hit our target of 50.
+                    items_found = min(len(seen_urls), TARGET_ITEMS)
 
             except Exception as exc:
                 result.error = str(exc)[:150]

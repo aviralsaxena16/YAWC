@@ -1,1 +1,7 @@
 .json
+.env
+traces
+pdfs
+generated
+chroma_db
+benchmark/.env

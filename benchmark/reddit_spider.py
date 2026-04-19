@@ -163,8 +163,7 @@ class RedditSpider(YAWCBaseSpider):
         collected: list[dict] = []
         seen_urls: set[str] = set()
         scroll_round = 0
-        max_scrolls  = max(20, self.k // 4)
-        stall_count  = 0
+        max_scrolls  = 40
 
         while len(collected) < self.k and scroll_round < max_scrolls:
             posts = await page.evaluate(_REDDIT_EXTRACT_JS)
@@ -184,16 +183,8 @@ class RedditSpider(YAWCBaseSpider):
             if len(collected) >= self.k:
                 break
 
-            if new_count == 0:
-                stall_count += 1
-                if stall_count >= 4:
-                    self.logger.warning("[Reddit] Feed exhausted (4 empty scrolls).")
-                    break
-            else:
-                stall_count = 0
-
-            await page.mouse.wheel(0, 2500)
-            await page.wait_for_timeout(2500)
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(3000)
 
         await self._stop_trace(page, "reddit")
         await page.close()
