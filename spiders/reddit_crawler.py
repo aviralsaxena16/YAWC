@@ -73,7 +73,7 @@ def setup_logging(target_name: str) -> logging.Logger:
 # ──────────────────────────────────────────────────────────────────────────────
 class ProgressStore:
     def __init__(self, target_name: str, logger: logging.Logger):
-        safe = target_name.replace("/", "_")
+        safe = target_name.replace("r/", "").replace("/", "_")
         self.output_path = OUTPUT_DIR / f"{safe}_posts.jsonl"
         self.seen_urls: set = set()
         self.logger = logger
