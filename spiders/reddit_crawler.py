@@ -263,6 +263,9 @@ class HumanRedditSpider(scrapy.Spider):
             content = await page.content()
             self._log(f"[FEED] Page source (first 3000 chars):\n{content[:3000]}", "error")
             await page.close()
+            if not self._time_exceeded():
+                self._log("[RETRY] Re-requesting feed...")
+                yield self._build_feed_request(context=context)
             return
 
         # JS extractor — handles both shreddit-post and legacy layouts
@@ -336,6 +339,12 @@ class HumanRedditSpider(scrapy.Spider):
 
         self._log(f"[SCROLL] Queuing {len(all_links)} post requests.")
         await page.close()
+
+        # 🔁 keep crawler alive for 24h
+        if not self._time_exceeded():
+            self._log("[LOOP] Sleeping before next feed refresh...")
+            await asyncio.sleep(30)
+            yield self._build_feed_request(context=context)
 
         for link in list(all_links):
             if self._time_exceeded():
@@ -414,7 +423,10 @@ class HumanRedditSpider(scrapy.Spider):
                 await page.close()
             except Exception:
                 pass
-
+        if not self._time_exceeded():
+            self._log("[RETRY] Retrying feed after error in 10s...")
+            await asyncio.sleep(10)
+            yield self._build_feed_request()
     # ── request builder ───────────────────────────────────────────────────────
     def _build_feed_request(self, context="default"):
         return scrapy.Request(
@@ -573,7 +585,7 @@ def main():
     )
 
     try:
-        process.start()
+        process.start(stop_after_crawl=False)
     except SystemExit:
         pass
 
