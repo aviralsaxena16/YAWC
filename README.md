@@ -1,4 +1,4 @@
-# YAWC — Yet Another Web Crawler
+# YAWC : Yet Another Web Crawler
 
 > A real-time, AI-powered research agent that crawls the web live, synthesizes multi-platform results, and streams answers with inline citations — no paywalls, no hallucinations.
 
@@ -8,21 +8,21 @@
 
 YAWC is a full-stack research assistant built around a central chat interface. You ask a question, an LLM classifies your intent, and YAWC spins up Playwright-powered Scrapy spiders to scrape the most relevant platforms in real time. Results are chunked into a vector store, synthesized by the LLM, and streamed back to you word-by-word with clickable source citations.
 
----
+
 
 ## Features & Specialities
 
-- **Intent-aware platform routing** — the LLM classifies every query by intent (text, video, image) and selects the best 2–4 platforms automatically
-- **Multi-platform crawling** — Reddit, Quora, StackOverflow, Hacker News, Wikipedia, YouTube, and image sources (Pexels → Pixabay → Unsplash fallback chain)
-- **Quick mode vs. Deep Research mode** — controls how many posts are crawled per platform (configurable per spider)
-- **RAG-backed follow-ups** — scraped content is chunked and stored in ChromaDB; follow-up questions query memory instead of re-crawling
-- **Live SSE streaming** — real-time status updates ("Spinning up YAWC headless browser…", "Scraped 8 posts…") and word-by-word LLM token streaming
-- **Inline citations** — the AI cites sources directly in text `[1]`, hyperlinked to the exact post title, upvote score, and original URL
-- **Teach YAWC (custom spider generation)** — point YAWC at any URL, walk through the page with Playwright Codegen, and an LLM compiles a production-ready Scrapy spider automatically
-- **PDF export** — export any research session as a branded PDF report
-- **Playwright trace capture** — every spider run saves a `.zip` trace file for debugging; downloadable and viewable via the Playwright Trace Viewer
-- **Dual LLM support** — plug in Google Gemini (`gemini-2.5-flash`) or Anthropic Claude (`claude-sonnet-4`) via a single env var switch
-- **Anti-fragile extraction** — spiders avoid brittle CSS selectors; generated spiders grab raw `document.body.innerText` and use an inline LLM call to parse structured JSON
+- **Intent-aware platform routing** : the LLM classifies every query by intent (text, video, image) and selects the best 2–4 platforms automatically
+- **Multi-platform crawling** : Reddit, Quora, StackOverflow, Hacker News, Wikipedia, YouTube, and image sources (Pexels → Pixabay → Unsplash fallback chain)
+- **Quick mode vs. Deep Research mode** : controls how many posts are crawled per platform (configurable per spider)
+- **RAG-backed follow-ups** : scraped content is chunked and stored in ChromaDB; follow-up questions query memory instead of re-crawling
+- **Live SSE streaming** : real-time status updates ("Spinning up YAWC headless browser…", "Scraped 8 posts…") and word-by-word LLM token streaming
+- **Inline citations** : the AI cites sources directly in text `[1]`, hyperlinked to the exact post title, upvote score, and original URL
+- **Teach YAWC (custom spider generation)**: point YAWC at any URL, walk through the page with Playwright Codegen, and an LLM compiles a production-ready Scrapy spider automatically
+- **PDF export** : export any research session as a branded PDF report
+- **Playwright trace capture** : every spider run saves a `.zip` trace file for debugging; downloadable and viewable via the Playwright Trace Viewer
+- **Dual LLM support** : plug in Google Gemini (`gemini-2.5-flash`) or Anthropic Claude (`claude-sonnet-4`) via a single env var switch
+- **Anti-fragile extraction** : spiders avoid brittle CSS selectors; generated spiders grab raw `document.body.innerText` and use an inline LLM call to parse structured JSON
 
 ---
 
